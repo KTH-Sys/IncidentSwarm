@@ -140,7 +140,7 @@ def run_once(scenario_id: str, mode: str, pipeline_version: str, *,
     run_id = f"{scenario_id}-{mode}-{pipeline_version}-{uuid.uuid4().hex[:6]}"
     ctx = RunContext(run_id=run_id, pipeline_version=pipeline_version, mode=mode,
                      scenario_id=scenario_id, fault_type=truth.fault_type.value)
-    em = Emitter(ctx, sink=sink, load_only=False)  # row inserts are supported
+    em = Emitter(ctx, sink=sink, load_only=True)  # micro-batch: each flush is an upload
     c = client_ or client()
 
     t0 = time.monotonic()

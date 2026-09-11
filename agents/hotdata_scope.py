@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,7 +129,10 @@ def provision(run_id: str, n: int, em: Emitter, *, client_: Any = None,
             count=n,
             name_template=f"{DB_PREFIX}-{run_id}-{{index}}",
             expires_at=ttl,
-            idempotency_key=f"{DB_PREFIX}-{run_id}",
+            # Unique per call: the key guards against a retried HTTP request,
+            # but reusing it across calls resurrects a spent (already-deleted)
+            # batch, which then resolves to zero database ids.
+            idempotency_key=f"{DB_PREFIX}-{run_id}-{uuid.uuid4().hex[:8]}",
             default_schema=DEFAULT_SCHEMA,
         )
     )
@@ -262,25 +267,45 @@ def query(db_id: str, sql: str, *, agent: str, kind: str = "sql", em: Emitter,
 
 def destroy(batch_id: str, em: Emitter, *, db_ids: list[str] | None = None,
             client_: Any = None) -> int:
-    """Delete a whole batch in one call. ALWAYS reached through try/finally.
+    """Delete the run's databases. ALWAYS reached through try/finally.
 
-    Never raises: a teardown failure must not mask a run's result. It is emitted
-    with success=False, and expires_at plus sweep() are the backstops.
+    Each database is deleted individually. `delete_database_batch` does NOT do
+    this — it cancels the creation batch ("databases already created are kept;
+    only further creation is stopped"), so calling it alone silently leaks every
+    DB the run made. Verified against the live API; see docs/verify.md item 5.
+
+    Deletes run concurrently because wave 3 is on the critical path and each call
+    is an independent round trip.
+
+    Never raises: a teardown failure must not mask a run's result. Failures are
+    emitted with success=False, and expires_at plus sweep() are the backstops.
     """
     api = hotdata.DatabasesApi(client_ or client())
-    t0 = time.monotonic()
-    try:
-        resp = api.delete_database_batch(batch_id)
-        deleted = resp.deleted_count or 0
-        ok, err = True, None
-    except Exception as exc:  # noqa: BLE001
-        deleted, ok, err = 0, False, str(exc)[:500]
+    ids = list(db_ids or [])
+    deleted = 0
 
-    each_ms = (time.monotonic() - t0) * 1000 / max(len(db_ids or []), 1)
-    for db_id in db_ids or [None]:
-        em.event("db_destroy", agent="pipeline", wave=3, db_id=db_id,
-                 duration_ms=each_ms, success=ok, error_msg=err,
-                 payload={"batch_id": batch_id, "deleted_count": deleted})
+    def _one(db_id: str) -> tuple[str, bool, str | None, float]:
+        t0 = time.monotonic()
+        try:
+            api.delete_database(db_id)
+            return db_id, True, None, (time.monotonic() - t0) * 1000
+        except Exception as exc:  # noqa: BLE001
+            return db_id, False, str(exc)[:500], (time.monotonic() - t0) * 1000
+
+    if ids:
+        with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+            for db_id, ok, err, ms in pool.map(_one, ids):
+                deleted += ok
+                em.event("db_destroy", agent="pipeline", wave=3, db_id=db_id,
+                         duration_ms=ms, success=ok, error_msg=err,
+                         payload={"batch_id": batch_id})
+
+    # Stop the creation batch too, so a slow batch cannot add DBs after teardown.
+    if batch_id:
+        try:
+            api.delete_database_batch(batch_id)
+        except Exception:  # noqa: BLE001 — best effort; the DBs are already gone
+            pass
     return deleted
 
 

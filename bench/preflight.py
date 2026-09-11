@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow as pa
@@ -145,29 +146,85 @@ def check_telemetry_db() -> bool:
         return False
 
 
-def create_telemetry_db() -> None:
-    """Create the event-scoped telemetry DB and its frozen events table."""
+def seed_schema(db_id: str, client_=None) -> None:
+    """Pin the events table's column types with one typed parquet load.
+
+    A declared managed table has NO schema until its first load — querying it
+    first returns "declared but has no data". Since Hotdata has no ALTER path
+    (§9.1), that first load decides the types permanently. Loading JSON would let
+    the types be inferred from whichever columns happened to be non-null, so we
+    seed from telemetry.schema.ARROW_SCHEMA instead, which is the frozen spec.
+
+    The seed row is tagged event_type='schema_seed'. Every query in queries.sql
+    filters on a real event_type, so it never shows up in results.
+    """
+    import hotdata
+
+    from agents.hotdata_scope import DEFAULT_SCHEMA, client as make_client
+    from telemetry.schema import ARROW_SCHEMA, TABLE, blank_row
+
+    c = client_ or make_client()
+    row = blank_row()
+    row.update(event_id="schema_seed", run_id="schema_seed", event_type="schema_seed",
+               agent="pipeline", pipeline_version="seed", mode="parallel",
+               scenario_id="seed", wave=0, ts=datetime.now(timezone.utc),
+               success=True, duration_ms=0.0, tokens_in=0, tokens_out=0,
+               cost_usd=0.0, query_count=0, rows_returned=0, retry_count=0,
+               score=0, hit_service=False, hit_fault=False)
+    tmp = Path(tempfile.mkdtemp()) / "seed.parquet"
+    pq.write_table(pa.table({n: [row[n]] for n in ARROW_SCHEMA.names},
+                            schema=ARROW_SCHEMA), tmp)
+
+    upload_id = hotdata.UploadsApi(c).upload_file(
+        tmp, filename="seed.parquet",
+        content_type="application/vnd.apache.parquet").upload_id
+    hotdata.DatabasesApi(c).load_database_table(
+        db_id, DEFAULT_SCHEMA, TABLE,
+        hotdata.LoadManagedTableRequest(upload_id=upload_id, format="parquet",
+                                        mode="replace"))
+
+
+def create_telemetry_db(existing: str | None = None) -> None:
+    """Create (or repair) the event-scoped telemetry DB and its frozen table."""
     import hotdata
 
     from agents.hotdata_scope import DEFAULT_SCHEMA, client
-    from telemetry.schema import TABLE, create_table_sql
+    from telemetry.schema import TABLE
 
     c = client()
     api = hotdata.DatabasesApi(c)
-    db = api.create_database(hotdata.CreateDatabaseRequest(
-        name=f"isw-telemetry-{time.strftime('%Y%m%d')}", default_schema=DEFAULT_SCHEMA))
-    db_id = getattr(db, "id", None) or getattr(getattr(db, "database", None), "id", None)
-    api.add_database_table(db_id, DEFAULT_SCHEMA,
-                           hotdata.AddManagedTableRequest(name=TABLE))
-    hotdata.QueryApi(c).query(hotdata.QueryRequest(
-        database_id=db_id, sql=create_table_sql(), default_schema=DEFAULT_SCHEMA))
-    print(f"\nTelemetry DB created. Add this to .env:\n\n    TELEMETRY_DB_ID={db_id}\n")
-    print("This DB is event-scoped: never tear it down. Every run of the day writes here.")
+
+    if existing:
+        db_id = existing
+        print(f"repairing existing telemetry DB {db_id}")
+    else:
+        db = api.create_database(hotdata.CreateDatabaseRequest(
+            name=f"isw-telemetry-{time.strftime('%Y%m%d')}",
+            default_schema=DEFAULT_SCHEMA))
+        db_id = getattr(db, "id", None) or getattr(getattr(db, "database", None), "id", None)
+
+    try:
+        api.add_database_table(db_id, DEFAULT_SCHEMA,
+                               hotdata.AddManagedTableRequest(name=TABLE))
+    except hotdata.ApiException as exc:
+        if exc.status not in (400, 409):
+            raise
+
+    seed_schema(db_id, c)
+
+    resp = hotdata.QueryApi(c).query(hotdata.QueryRequest(
+        database_id=db_id, sql=f"SELECT COUNT(*) AS n FROM {TABLE}",
+        default_schema=DEFAULT_SCHEMA))
+    print(f"\nevents table ready ({(resp.rows or [[0]])[0][0]} seed row).")
+    print(f"Add this to .env:\n\n    TELEMETRY_DB_ID={db_id}\n")
+    print("This DB is event-scoped: never tear it down. Every run today writes here.")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Verify the stack end to end.")
     ap.add_argument("--create-telemetry-db", action="store_true")
+    ap.add_argument("--repair-telemetry-db", metavar="DB_ID",
+                    help="seed the frozen schema on an existing telemetry DB")
     ap.add_argument("--skip-gate1", action="store_true", help="skip the live DB cycle")
     args = ap.parse_args()
 
@@ -175,11 +232,11 @@ def main() -> int:
     have_env = check_env()
     print()
 
-    if args.create_telemetry_db:
+    if args.create_telemetry_db or args.repair_telemetry_db:
         if not have_env:
-            print("\nCannot create the telemetry DB without hotdata credentials.")
+            print("\nCannot touch the telemetry DB without hotdata credentials.")
             return 1
-        create_telemetry_db()
+        create_telemetry_db(args.repair_telemetry_db)
         return 0
 
     check_data()

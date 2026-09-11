@@ -8,21 +8,55 @@ rather than by asking a mentor. Items 1–2 are RocketRide-side and still open.
 |---|---|---|
 | 1 | How a RocketRide agent node calls custom Python / LangChain tools inside a wave | **OPEN** — mentor |
 | 2 | Whether waves take runtime values (wave-0 `db_ids` → wave-1 agent config) | **OPEN** — mentor, gating |
-| 3 | Row inserts vs load-only | **RESOLVED** |
-| 4 | Bulk-create: sync vs async, time to ready | **RESOLVED** |
-| 5 | Delete-DB call and rate limits | **RESOLVED** |
+| 3 | Row inserts vs load-only | **RESOLVED against the live API** |
+| 4 | Bulk-create: sync vs async, time to ready | **RESOLVED** — ~0.6-1.1s for 2 DBs |
+| 5 | Delete-DB call and rate limits | **RESOLVED — earlier note was WRONG, see below** |
 | 6 | Index refresh after loads into an existing table | **RESOLVED (partly)** |
-| 7 | SQL dialect details | **RESOLVED (offline)** |
+| 7 | SQL dialect details | **RESOLVED — Q1-Q7 all run on Hotdata** |
 
-## 3 — Row inserts ARE supported
+Items 3, 5, and 7 were first answered by reading the SDK and then **corrected by
+running against the real API**. Two of those first answers were wrong in ways
+that would have cost the afternoon. The SDK tells you what a call is named; only
+the API tells you what it does.
 
-`LoadManagedTableRequest` takes `mode` (`"replace"`, `"append"`, `"update"`,
-`"upsert"`, `"delete"`) and accepts either inline `data` or a staged `upload_id`.
+## 3 — Appends work, but only as typed parquet
 
-So telemetry does **not** need the load-only micro-batch workaround: append
-micro-batches directly with inline `data`. `Emitter(..., load_only=False)` — flush
-every 50 events or 2s (§9.2). Inline data is documented as the quick path for
-small payloads; parquet slices go through the uploads API instead.
+`LoadManagedTableRequest` takes `mode` (`"replace"`, `"append"`, ...) and accepts
+either inline `data` or a staged `upload_id`. Appends exist, so §9.2's load-only
+fear was unfounded — but two live failures narrowed the usable path to one:
+
+1. **Inline `data` accepts only CSV.** JSON returns
+   `inline "data" supports only "csv"; upload the file and load it by upload_id`.
+2. **CSV types are inferred per batch.** The events schema is deliberately sparse
+   — each `event_type` fills a different subset of the 28 columns — so a column
+   that is entirely null in one micro-batch is inferred as `varchar` and rejected
+   against the pinned `int32`. This is not an edge case; it is every batch.
+
+So `HotdataSink` writes **parquet built from `ARROW_SCHEMA`** — the same schema
+that pinned the table — and loads it by `upload_id`. Types match by construction.
+It costs an upload round trip per flush, which is why the emitter micro-batches
+at `agent_end` / `wave_end` (`load_only=True`) rather than flushing per event.
+
+### The events table schema is pinned by its FIRST load, permanently
+
+A declared managed table has no schema until data lands: querying it first
+returns `declared but has no data; POST a load before querying`. Whatever lands
+first decides the column types, and there is no way back —
+`DROP TABLE` returns `COPY TO, DML, and DDL statements are not supported`, and a
+type change returns `only widening to a larger compatible type is applied`.
+**The only recovery is deleting the whole database and recreating it.**
+
+`bench.preflight --create-telemetry-db` therefore seeds the table with one typed
+parquet row from `ARROW_SCHEMA` before anything else writes. The seed row is
+tagged `event_type='schema_seed'` and every query in `queries.sql` filters on a
+real event_type, so it never appears in results.
+
+Two type traps found this way, both now encoded in `telemetry/schema.py`:
+
+- `ts` must be a **naive** timestamp holding UTC. The CSV loader always infers
+  naive `timestamp`, and `timestamptz` cannot be narrowed afterwards.
+- `ts` must be **microsecond** precision, matching `pa.timestamp("us")`. A
+  millisecond value is inferred as `timestamp_ms` and rejected.
 
 ## 4 — Bulk-create is ASYNC
 
@@ -37,10 +71,22 @@ Time-to-ready is unmeasured until credentials land — if it exceeds 10s, §13's
 mitigation applies: pre-warm a DB pool per batch and report provisioning
 separately in Q7.
 
-## 5 — Teardown is ONE call
+## 5 — Teardown is NOT one call (correcting an earlier note)
 
-`delete_database_batch(batch_id)` deletes the whole batch and returns
-`deleted_count`. Wave 3 does not need five delete calls.
+An earlier version of this file claimed `delete_database_batch(batch_id)` tears
+down the whole batch. **It does not.** It cancels the creation batch — the SDK's
+own wording is "databases already created are kept; only further creation is
+stopped". Called alone it returns `deleted_count: 0` and silently leaks every
+database the run created.
+
+Caught by `bench.preflight`, which checks that teardown actually deleted what it
+made. Wave 3 now deletes each database individually with `delete_database(id)`,
+concurrently since each is an independent round trip, and cancels the creation
+batch afterwards so a slow batch cannot add databases after teardown.
+
+A second trap in the same area: `idempotency_key` must be unique **per call**.
+Deriving it from `run_id` alone means a retried run resurrects its spent batch,
+which then resolves to zero database ids.
 
 Better still, `BulkCreateDatabasesRequest` accepts `expires_at` as a relative
 duration (`"30m"`). Every run-scoped DB now self-expires, so a crash that skips
@@ -65,15 +111,19 @@ is §12 cut-list item 1 anyway.
 Whether an index refreshes after a later load into the same table is still
 untested, and matters for FTS over telemetry `error_msg` in Q5.
 
-## 7 — SQL dialect
+## 7 — SQL dialect: all seven queries run
 
-Tested offline with DuckDB against the generated parquet (`python -m bench.validate`),
-which is not proof for Hotdata's engine but does prove the queries are sound SQL.
-Wave-0 triage uses only CTEs, `ROW_NUMBER() OVER (PARTITION BY ...)`, a scalar
-subquery, and `CASE` — no interval arithmetic, no casts, no `FILTER`.
+**Q1-Q7 were executed against the live telemetry DB and all seven returned
+rows.** That includes the two that were in doubt: `PERCENTILE_CONT(...) WITHIN
+GROUP (ORDER BY ...)` in Q3 and `RANK() OVER (PARTITION BY ...)` in Q2. The
+`approx_percentile_cont` fallback is not needed.
 
-`PERCENTILE_CONT ... WITHIN GROUP` in Q3 is still unverified against Hotdata;
-the documented fallback is `approx_percentile_cont(duration_ms, 0.95)`.
+Wave-0 triage is also dialect-safe by construction: CTEs, `ROW_NUMBER() OVER`, a
+scalar subquery, and `CASE` — no interval arithmetic, no casts, no `FILTER`.
+
+One hard limit worth knowing: the query API is **read-only**. `COPY TO, DML, and
+DDL statements are not supported`, so tables are created and shaped exclusively
+through the databases/uploads APIs.
 
 ## Useful API surface
 

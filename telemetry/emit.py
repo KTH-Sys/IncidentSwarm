@@ -14,9 +14,12 @@ to data/telemetry_backlog/*.parquet and replayed at batch end.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 import uuid
@@ -68,12 +71,20 @@ class Sink(Protocol):
 class HotdataSink:
     """Appends micro-batches into the persistent telemetry DB.
 
-    VERIFY item 3 is resolved: row inserts ARE supported — a managed-table load
-    with mode="append" and inline `data`. So telemetry appends directly and does
-    not need the load-only parquet workaround.
+    Writes typed **parquet**, not inline CSV. Inline `data` accepts only CSV, and
+    CSV types are *inferred per batch* — so a column that happens to be entirely
+    null in one micro-batch (say `retry_count` in a batch of query rows) is
+    inferred as varchar and rejected against the pinned int32. The events schema
+    is deliberately sparse — each event_type fills a different subset of the 28
+    columns — so that is not an edge case, it is every batch.
 
-    The telemetry DB is event-scoped: created once at schema-freeze time, never
-    torn down, and shared across every run of the event (§9.1).
+    Parquet carries the types explicitly, built from the same ARROW_SCHEMA that
+    pinned the table, so every append matches by construction. It costs an upload
+    round trip per flush, which is why the emitter micro-batches at agent_end /
+    wave_end rather than flushing per event.
+
+    The telemetry DB is event-scoped: created once, never torn down, shared
+    across every run of the event (§9.1).
     """
 
     def __init__(self, db_id: str | None = None, table: str = TABLE,
@@ -85,40 +96,28 @@ class HotdataSink:
         self.schema = schema
         self._client = client
 
-    def _api(self):
-        import hotdata
-
-        from agents.hotdata_scope import client as make_client
-        return hotdata.DatabasesApi(self._client or make_client())
+    def _c(self):
+        if self._client is None:
+            from agents.hotdata_scope import client as make_client
+            self._client = make_client()
+        return self._client
 
     def write(self, batch: list[dict[str, Any]]) -> None:
         import hotdata
 
-        ndjson = "\n".join(json.dumps(_jsonable(row), default=str) for row in batch)
-        self._api().load_database_table(
-            self.db_id, self.schema, self.table,
-            hotdata.LoadManagedTableRequest(data=ndjson, format="json", mode="append"),
-        )
-
-    def create_table(self) -> None:
-        """Run once, at schema-freeze time (§11, 10:00-11:00)."""
-        import hotdata
-
-        from agents.hotdata_scope import client as make_client
-        from telemetry.schema import create_table_sql
-
-        api = hotdata.QueryApi(self._client or make_client())
-        api.query(hotdata.QueryRequest(database_id=self.db_id,
-                                       sql=create_table_sql(self.table),
-                                       default_schema=self.schema))
-
-
-def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
-    """Timestamps to ISO strings; everything else passes through."""
-    out = {}
-    for k, v in row.items():
-        out[k] = v.isoformat() if isinstance(v, datetime) else v
-    return out
+        c = self._c()
+        tmp = Path(tempfile.mkdtemp()) / "events.parquet"
+        pq.write_table(_to_table(batch), tmp)
+        try:
+            upload_id = hotdata.UploadsApi(c).upload_file(
+                tmp, filename="events.parquet",
+                content_type="application/vnd.apache.parquet").upload_id
+            hotdata.DatabasesApi(c).load_database_table(
+                self.db_id, self.schema, self.table,
+                hotdata.LoadManagedTableRequest(upload_id=upload_id, format="parquet",
+                                                mode="append"))
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 class ParquetSink:

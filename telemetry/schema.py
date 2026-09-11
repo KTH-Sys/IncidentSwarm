@@ -6,6 +6,12 @@ Hotdata tables have no ALTER path, so this is finalized BEFORE the first run
 Aggregation convention (§9.1): per-agent totals live on `agent_end` rows, per-run
 totals on `run_end` rows. Never SUM over `llm_call` and `agent_end` together, or
 you double-count.
+
+`ts` is a NAIVE timestamp holding UTC. Hotdata's CSV loader always infers naive
+`timestamp`, and a column cannot change type from `timestamptz` after the table's
+schema is pinned — so a tz-aware column would reject every inline write. Every
+timestamp in this system is UTC by construction (the generator and the emitter
+both use timezone.utc), so nothing is lost; just never write a local time here.
 """
 
 from __future__ import annotations
@@ -60,7 +66,7 @@ COLUMNS: dict[str, tuple[pa.DataType, str]] = {
     "agent": (pa.string(), "all"),
     "wave": (pa.int32(), "all"),
     "event_type": (pa.string(), "all"),
-    "ts": (pa.timestamp("us", tz="UTC"), "all"),
+    "ts": (pa.timestamp("us"), "all"),
     "duration_ms": (pa.float64(), "*_end, query, llm_call, db_*"),
     "model": (pa.string(), "llm_call, agent_end"),
     "tokens_in": (pa.int64(), "llm_call; summed on agent_end and run_end"),
@@ -97,7 +103,7 @@ def create_table_sql(table: str = TABLE) -> str:
         pa.int64(): "BIGINT",
         pa.float64(): "DOUBLE",
         pa.bool_(): "BOOLEAN",
-        pa.timestamp("us", tz="UTC"): "TIMESTAMP",
+        pa.timestamp("us"): "TIMESTAMP",
     }
     cols = ",\n  ".join(f"{n} {sql_types[t]}" for n, (t, _) in COLUMNS.items())
     return f"CREATE TABLE IF NOT EXISTS {table} (\n  {cols}\n);"
