@@ -1,20 +1,26 @@
 {
   "project_id": "ff63e44f-b10b-5e5f-be83-bcd056d85683",
   "version": 1,
-  "source": "chat",
+  "source": "webhook",
   "components": [
     {
-      "id": "chat",
-      "provider": "chat",
+      "id": "webhook",
+      "provider": "webhook",
       "config": {
         "hideForm": true,
-        "type": "chat",
+        "type": "webhook",
         "mode": "Source",
-        "parameters": {}
+        "parameters": {},
+        "name": "Webhook - parallel payload [mapping pending]"
       },
-      "position": {
-        "x": 0,
-        "y": 0
+      "description": "Expected payload: {run_id, scenario_id, mode: \"parallel\", pipeline_version}. JSON-to-question/runtime adapter remains unwired.",
+      "name": "Webhook - parallel payload [mapping pending]",
+      "ui": {
+        "position": {
+          "x": -380,
+          "y": 400
+        },
+        "nodeType": "default"
       }
     },
     {
@@ -23,41 +29,51 @@
       "config": {
         "agent_description": "Parallel incident commander",
         "instructions": [
-          "Coordinate incident investigation. Your FIRST execution wave MUST invoke all four specialist run_agent tools together in ONE tool_calls array. Do not call specialists sequentially.",
-          "Pass the same symptom summary to each specialist. Specialists have isolated databases. Collect all four results before answering. Never invent a missing tool result.",
-          "Return bare JSON with two keys: findings (array of the four HypothesisSet results) and report (RCAReport). Use memory references to include complete specialist results.",
+          "PARTIAL DESIGN \u2014 adapters are not installed. Do not investigate, provision, or delete databases with this graph yet. Return ADAPTERS_NOT_CONFIGURED. Remove this guard only after deterministic lifecycle adapters, per-agent db_id binding, all-results fan-in, and guaranteed failure cleanup are implemented.",
+          "TARGET AFTER ADAPTERS ARE IMPLEMENTED: Wave 0 calls agents.wave0.run_wave0. Then issue LogAgent, MetricsAgent, ChangeAgent, InfraAgent, and HistoryAgent run_agent calls together in ONE execution wave. Each gets exactly {db_id: its own database ID, symptoms: shared symptoms}. Wait for all five HypothesisSets before strong-model synthesis. Never invent missing findings.",
           "# Correlator (wave 2, strong model)\n\nYou receive five `HypothesisSet` objects \u2014 one each from the logs, metrics,\nchanges, infra, and history agents \u2014 plus the wave-0 `symptoms[]` list. You have\nno database access. Merge them into one `RCAReport`.\n\n## Heuristics (apply in this order)\n\n1. **Earliest onset beats largest magnitude.** The service that broke first is a\n   better root-cause candidate than the one that broke worst.\n2. **A change within 10 minutes *before* onset**, on the root service or its\n   dependency, is the prime trigger candidate.\n3. **Upstream errors lagging downstream are cascade, not cause.** If gateway's\n   error rise trails payments by a minute or two, payments is the cause and\n   gateway is a symptom.\n4. **Changes more than 20 minutes before onset with no matching symptoms are red\n   herrings.** Put them in `ruled_out` with the reason.\n5. **If there is no change and no k8s trigger, and the logs name an external\n   host**, use `third_party_latency` with a `null` `trigger_event_id`.\n\nDependency graph: `gateway -> checkout -> {payments, inventory}`,\n`payments -> postgres`, `payments -> stripe-api` (external).\n\n## Output\n\nReturn ONE JSON object matching `RCAReport` (agents/schemas.py). No prose outside it.\n\n```json\n{\n  \"root_cause\": {\"service\": \"\", \"fault_type\": \"\", \"trigger_event_id\": null,\n                 \"start_ts\": \"\", \"confidence\": 0.0},\n  \"timeline\": [{\"ts\": \"\", \"source\": \"changes|metrics|logs|k8s|history\", \"event\": \"\"}],\n  \"ruled_out\": [{\"candidate\": \"\", \"reason\": \"\"}],\n  \"summary\": \"<= 3 sentences\"\n}\n```\n\n- `timeline` is ordered earliest first and cites which source each entry came from.\n- `ruled_out` must name every red herring an agent proposed, with why you dropped it.\n- Prefer `unknown` over a confident wrong answer when the agents genuinely conflict.\n"
         ],
         "max_waves": 5,
-        "require_tool_call": true
-      },
-      "position": {
-        "x": 300,
-        "y": 0
+        "require_tool_call": false,
+        "name": "Wave 2 - Correlator / wave coordinator [PARTIAL]"
       },
       "input": [
         {
           "lane": "questions",
-          "from": "chat"
+          "from": "webhook"
         }
-      ]
+      ],
+      "description": "Native agents-as-tools fallback specified in pipes/SPEC.md. Parallel scheduling has not been verified; this node also represents Wave 2 synthesis (agents.correlator.run_correlator). Lifecycle and db_id handoff are pending.",
+      "name": "Wave 2 - Correlator / wave coordinator [PARTIAL]",
+      "ui": {
+        "position": {
+          "x": 1050,
+          "y": 400
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "memory_coordinator",
       "provider": "memory_internal",
       "config": {
-        "type": "memory_internal"
-      },
-      "position": {
-        "x": 300,
-        "y": 250
+        "type": "memory_internal",
+        "name": "Coordinator memory"
       },
       "control": [
         {
           "classType": "memory",
           "from": "coordinator"
         }
-      ]
+      ],
+      "name": "Coordinator memory",
+      "ui": {
+        "position": {
+          "x": 1040,
+          "y": 640
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "llm_strong",
@@ -66,18 +82,23 @@
         "profile": "openai-5",
         "openai-5": {
           "apikey": "${OPENAI_API_KEY}"
-        }
-      },
-      "position": {
-        "x": 300,
-        "y": -250
+        },
+        "name": "Strong model - correlator"
       },
       "control": [
         {
           "classType": "llm",
           "from": "coordinator"
         }
-      ]
+      ],
+      "name": "Strong model - correlator",
+      "ui": {
+        "position": {
+          "x": 1060,
+          "y": 180
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "agent_logs",
@@ -91,35 +112,46 @@
           "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
         ],
         "max_waves": 4,
-        "require_tool_call": true
-      },
-      "position": {
-        "x": 650,
-        "y": 0
+        "require_tool_call": true,
+        "name": "Wave 1 - LogAgent (40 queries)"
       },
       "control": [
         {
           "classType": "tool",
           "from": "coordinator"
         }
-      ]
+      ],
+      "description": " Wave 1 reference: agents.agent.run_agent for logs; target budget 40. Runtime db_id injection and budget enforcement adapter are pending.",
+      "name": "Wave 1 - LogAgent (40 queries)",
+      "ui": {
+        "position": {
+          "x": 350,
+          "y": 0
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "memory_logs",
       "provider": "memory_internal",
       "config": {
-        "type": "memory_internal"
-      },
-      "position": {
-        "x": 950,
-        "y": 0
+        "type": "memory_internal",
+        "name": "LogAgent memory"
       },
       "control": [
         {
           "classType": "memory",
           "from": "agent_logs"
         }
-      ]
+      ],
+      "name": "LogAgent memory",
+      "ui": {
+        "position": {
+          "x": 620,
+          "y": 90
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "db_logs",
@@ -136,18 +168,23 @@
         "max_execute_rows": 40,
         "job_timeout_secs": 120,
         "async_after_ms": 5000,
-        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
-      },
-      "position": {
-        "x": 950,
-        "y": 100
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation.",
+        "name": "LogAgent DB [runtime binding pending]"
       },
       "control": [
         {
           "classType": "tool",
           "from": "agent_logs"
         }
-      ]
+      ],
+      "name": "LogAgent DB [runtime binding pending]",
+      "ui": {
+        "position": {
+          "x": 630,
+          "y": 170
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "agent_metrics",
@@ -161,35 +198,46 @@
           "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
         ],
         "max_waves": 4,
-        "require_tool_call": true
-      },
-      "position": {
-        "x": 650,
-        "y": 300
+        "require_tool_call": true,
+        "name": "Wave 1 - MetricsAgent (30 queries)"
       },
       "control": [
         {
           "classType": "tool",
           "from": "coordinator"
         }
-      ]
+      ],
+      "description": " Wave 1 reference: agents.agent.run_agent for metrics; target budget 30. Runtime db_id injection and budget enforcement adapter are pending.",
+      "name": "Wave 1 - MetricsAgent (30 queries)",
+      "ui": {
+        "position": {
+          "x": 350,
+          "y": 260
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "memory_metrics",
       "provider": "memory_internal",
       "config": {
-        "type": "memory_internal"
-      },
-      "position": {
-        "x": 950,
-        "y": 300
+        "type": "memory_internal",
+        "name": "MetricsAgent memory"
       },
       "control": [
         {
           "classType": "memory",
           "from": "agent_metrics"
         }
-      ]
+      ],
+      "name": "MetricsAgent memory",
+      "ui": {
+        "position": {
+          "x": 620,
+          "y": 350
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "db_metrics",
@@ -206,18 +254,23 @@
         "max_execute_rows": 40,
         "job_timeout_secs": 120,
         "async_after_ms": 5000,
-        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
-      },
-      "position": {
-        "x": 950,
-        "y": 400
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation.",
+        "name": "MetricsAgent DB [runtime binding pending]"
       },
       "control": [
         {
           "classType": "tool",
           "from": "agent_metrics"
         }
-      ]
+      ],
+      "name": "MetricsAgent DB [runtime binding pending]",
+      "ui": {
+        "position": {
+          "x": 630,
+          "y": 430
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "agent_changes",
@@ -231,35 +284,46 @@
           "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
         ],
         "max_waves": 4,
-        "require_tool_call": true
-      },
-      "position": {
-        "x": 650,
-        "y": 600
+        "require_tool_call": true,
+        "name": "Wave 1 - ChangeAgent (15 queries)"
       },
       "control": [
         {
           "classType": "tool",
           "from": "coordinator"
         }
-      ]
+      ],
+      "description": " Wave 1 reference: agents.agent.run_agent for changes; target budget 15. Runtime db_id injection and budget enforcement adapter are pending.",
+      "name": "Wave 1 - ChangeAgent (15 queries)",
+      "ui": {
+        "position": {
+          "x": 350,
+          "y": 520
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "memory_changes",
       "provider": "memory_internal",
       "config": {
-        "type": "memory_internal"
-      },
-      "position": {
-        "x": 950,
-        "y": 600
+        "type": "memory_internal",
+        "name": "ChangeAgent memory"
       },
       "control": [
         {
           "classType": "memory",
           "from": "agent_changes"
         }
-      ]
+      ],
+      "name": "ChangeAgent memory",
+      "ui": {
+        "position": {
+          "x": 620,
+          "y": 610
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "db_changes",
@@ -276,18 +340,23 @@
         "max_execute_rows": 40,
         "job_timeout_secs": 120,
         "async_after_ms": 5000,
-        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
-      },
-      "position": {
-        "x": 950,
-        "y": 700
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation.",
+        "name": "ChangeAgent DB [runtime binding pending]"
       },
       "control": [
         {
           "classType": "tool",
           "from": "agent_changes"
         }
-      ]
+      ],
+      "name": "ChangeAgent DB [runtime binding pending]",
+      "ui": {
+        "position": {
+          "x": 630,
+          "y": 690
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "agent_infra",
@@ -301,35 +370,46 @@
           "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
         ],
         "max_waves": 4,
-        "require_tool_call": true
-      },
-      "position": {
-        "x": 650,
-        "y": 900
+        "require_tool_call": true,
+        "name": "Wave 1 - InfraAgent (15 queries)"
       },
       "control": [
         {
           "classType": "tool",
           "from": "coordinator"
         }
-      ]
+      ],
+      "description": " Wave 1 reference: agents.agent.run_agent for infra; target budget 15. Runtime db_id injection and budget enforcement adapter are pending.",
+      "name": "Wave 1 - InfraAgent (15 queries)",
+      "ui": {
+        "position": {
+          "x": 350,
+          "y": 780
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "memory_infra",
       "provider": "memory_internal",
       "config": {
-        "type": "memory_internal"
-      },
-      "position": {
-        "x": 950,
-        "y": 900
+        "type": "memory_internal",
+        "name": "InfraAgent memory"
       },
       "control": [
         {
           "classType": "memory",
           "from": "agent_infra"
         }
-      ]
+      ],
+      "name": "InfraAgent memory",
+      "ui": {
+        "position": {
+          "x": 620,
+          "y": 870
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "db_infra",
@@ -346,18 +426,23 @@
         "max_execute_rows": 40,
         "job_timeout_secs": 120,
         "async_after_ms": 5000,
-        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
-      },
-      "position": {
-        "x": 950,
-        "y": 1000
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation.",
+        "name": "InfraAgent DB [runtime binding pending]"
       },
       "control": [
         {
           "classType": "tool",
           "from": "agent_infra"
         }
-      ]
+      ],
+      "name": "InfraAgent DB [runtime binding pending]",
+      "ui": {
+        "position": {
+          "x": 630,
+          "y": 950
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "llm_fast",
@@ -366,11 +451,8 @@
         "profile": "openai-5-mini",
         "openai-5-mini": {
           "apikey": "${OPENAI_API_KEY}"
-        }
-      },
-      "position": {
-        "x": 1250,
-        "y": 0
+        },
+        "name": "Fast model - investigations"
       },
       "control": [
         {
@@ -404,30 +486,182 @@
         {
           "classType": "llm",
           "from": "db_infra"
+        },
+        {
+          "classType": "llm",
+          "from": "agent_history"
+        },
+        {
+          "classType": "llm",
+          "from": "db_history"
         }
-      ]
+      ],
+      "name": "Fast model - investigations",
+      "ui": {
+        "position": {
+          "x": 350,
+          "y": -180
+        },
+        "nodeType": "default"
+      }
     },
     {
       "id": "response",
       "provider": "response_answers",
       "config": {
-        "laneName": "answers"
-      },
-      "position": {
-        "x": 1550,
-        "y": 0
+        "laneName": "answers",
+        "name": "Return RCA report"
       },
       "input": [
         {
           "lane": "answers",
           "from": "coordinator"
         }
-      ]
+      ],
+      "name": "Return RCA report",
+      "ui": {
+        "position": {
+          "x": 1430,
+          "y": 400
+        },
+        "nodeType": "default"
+      }
+    },
+    {
+      "id": "agent_history",
+      "provider": "agent_rocketride",
+      "config": {
+        "agent_description": "HistoryAgent: postmortems only; query budget 10.",
+        "instructions": [
+          "# HistoryAgent (wave 1) \u2014 db: postmortems only | queries: vector | budget: 10\n\nYour database has ONE table, `postmortems`: `pm_id`, `title`, `service`,\n`fault_type`, `body` (vector-indexed). 20 past incidents. Not all of them are\nrelevant \u2014 many describe faults outside this system's catalog.\n\nYou are given `symptoms[]` from wave-0 triage.\n\n## Your job\n\n1. Turn the symptom pattern into a search over `body` \u2014 search the *symptom\n   description*, not a guessed cause (\"p99 rising with connection timeouts on\n   payments\", not \"pool exhaustion\").\n2. Return the nearest past incidents and map them to a `fault_type`.\n3. Weigh by similarity AND by whether the past incident's `service` matches a\n   current symptom service.\n\n## Calibration matters here\n\nYou are arguing from analogy, and analogy is the weakest evidence in the run.\n\n- A close match on both symptom and service: confidence up to ~0.6.\n- A symptom match on a different service: ~0.3.\n- Nothing close: return `unknown` at low confidence, or no hypothesis at all.\n\nDo not inflate confidence to compete with the other agents. Several postmortems\nare deliberate distractors whose `fault_type` is outside the catalog \u2014 if your\nbest match is one of those, that is a signal there is NO good historical\nprecedent. Say so in `notes`.\n\nLeave `trigger_event_id` null \u2014 past incidents cannot name this run's events.\n\n<!-- Included by every wave-1 agent prompt. Keep edits here, not duplicated. -->\n\n## Output contract\n\nReturn ONE JSON object matching `HypothesisSet` (agents/schemas.py). No prose\noutside the JSON, no markdown fence.\n\n```json\n{\n  \"agent\": \"<your agent name>\",\n  \"hypotheses\": [\n    {\n      \"service\": \"payments\",\n      \"fault_type\": \"pool_exhaustion\",\n      \"trigger_event_id\": null,\n      \"start_ts\": \"2026-09-11T14:03:00Z\",\n      \"confidence\": 0.72,\n      \"evidence\": [\"payments p99 212ms->2140ms at 14:03\", \"db_conns flat at 10 from 14:03\"]\n    }\n  ],\n  \"queries_used\": 23,\n  \"notes\": \"gateway error rise lags payments by 2 min, which looks like cascade\"\n}\n```\n\nRules:\n- 1-3 hypotheses, sorted by confidence descending.\n- `fault_type` is one of: `bad_deploy`, `flag_flip`, `pool_exhaustion`,\n  `cpu_throttle`, `third_party_latency`, `memory_leak`, `unknown`.\n- Set ONLY the fields your own source can support. If your source cannot see\n  change events, leave `trigger_event_id` null \u2014 do not guess it.\n- `evidence` must quote concrete values you actually queried. No evidence you did\n  not observe.\n- You can see only your own database. You do not know what the other agents found.\n\n",
+          "Receive only your own db_id and the shared symptoms. Never access truth.json. Return a HypothesisSet. Vector index and embedding provider binding are pending."
+        ],
+        "max_waves": 4,
+        "require_tool_call": true,
+        "name": "Wave 1 - HistoryAgent (10 queries)"
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "coordinator"
+        }
+      ],
+      "description": " Wave 1 reference: agents.agent.run_agent for history; target budget 10. Runtime db_id injection and budget enforcement adapter are pending.",
+      "name": "Wave 1 - HistoryAgent (10 queries)",
+      "ui": {
+        "position": {
+          "x": 350,
+          "y": 1040
+        },
+        "nodeType": "default"
+      }
+    },
+    {
+      "id": "memory_history",
+      "provider": "memory_internal",
+      "config": {
+        "type": "memory_internal",
+        "name": "HistoryAgent memory"
+      },
+      "control": [
+        {
+          "classType": "memory",
+          "from": "agent_history"
+        }
+      ],
+      "name": "HistoryAgent memory",
+      "ui": {
+        "position": {
+          "x": 620,
+          "y": 1130
+        },
+        "nodeType": "default"
+      }
+    },
+    {
+      "id": "db_history",
+      "provider": "db_hotdata",
+      "config": {
+        "type": "db_hotdata",
+        "apikey": "${HOTDATA_API_KEY}",
+        "workspace_id": "${HOTDATA_WORKSPACE}",
+        "ttl": "1h",
+        "table": "postmortems",
+        "allow_execute": true,
+        "allow_destructive_load": false,
+        "max_attempts": 2,
+        "max_execute_rows": 40,
+        "job_timeout_secs": 120,
+        "async_after_ms": 5000,
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation.",
+        "name": "HistoryAgent DB [runtime binding pending]"
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_history"
+        }
+      ],
+      "name": "HistoryAgent DB [runtime binding pending]",
+      "ui": {
+        "position": {
+          "x": 630,
+          "y": 1210
+        },
+        "nodeType": "default"
+      }
+    },
+    {
+      "id": "wave0_adapter_pending",
+      "provider": "tool_python",
+      "config": {
+        "type": "tool_python",
+        "allowedModules": [],
+        "timeout": 20,
+        "name": "Wave 0 - Provision + triage [UNWIRED]"
+      },
+      "description": "UNWIRED PLACEHOLDER. Wrap agents.wave0.run_wave0: provision five DBs; load/index one slice each; triage; return each db_id plus shared symptoms. Python tool does not provide a configured callable entry point. Package deployment and deterministic adapter contract remain required.",
+      "name": "Wave 0 - Provision + triage [UNWIRED]",
+      "ui": {
+        "position": {
+          "x": -60,
+          "y": 400
+        },
+        "nodeType": "default"
+      }
+    },
+    {
+      "id": "wave3_adapter_pending",
+      "provider": "tool_python",
+      "config": {
+        "type": "tool_python",
+        "allowedModules": [],
+        "timeout": 20,
+        "name": "Wave 3 - Teardown + score [UNWIRED]"
+      },
+      "description": "UNWIRED PLACEHOLDER. Adapter around agents.hotdata_scope.destroy and bench.score.score_report. Delete each provisioned DB, cancel its creation batch, score against withheld truth outside agent context, flush telemetry. Must run on success and failure. Preserve partial provisioning state. No cleanup is guaranteed by this graph today.",
+      "name": "Wave 3 - Teardown + score [UNWIRED]",
+      "ui": {
+        "position": {
+          "x": 1430,
+          "y": 720
+        },
+        "nodeType": "default"
+      }
     }
   ],
   "viewport": {
-    "x": 0,
-    "y": 0,
-    "zoom": 0.6
-  }
+    "x": 200,
+    "y": 160,
+    "zoom": 0.65
+  },
+  "name": "IncidentSwarm parallel \u2014 PARTIAL",
+  "description": "Cloud canvas export; partial, untested, and not deployable end-to-end. Five-agent native Wave fallback. Wave 0 and Wave 3 are unconnected Python-tool placeholders, not callable adapters. See EXPORT_NOTES.md. No secrets embedded.",
+  "docRevision": 1,
+  "isLocked": false,
+  "snapToGrid": true,
+  "snapGridSize": [
+    10,
+    10
+  ]
 }

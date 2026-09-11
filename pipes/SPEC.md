@@ -1,10 +1,13 @@
 # Pipeline spec — what to build in RocketRide Cloud
 
-**Status: planned integration.** No exported `.pipe` files or RocketRide runtime
-calls are present in this repository. The runnable implementation is
-`agents/pipeline.py`, which uses Python threads for fan-out. This document is a
-blueprint for wiring those functions into RocketRide after verifying the node
-and runtime-value contracts with the sponsor.
+**Status: partial Cloud exports available (2026-09-11).**
+`incident_parallel.pipe` and `incident_single.pipe` were saved to RocketRide
+Cloud staging and exported through its SDK file store. Both passed structural
+schema validation; neither has been run end-to-end. Wave 0 and Wave 3 remain
+unwired adapter placeholders; dynamic DB binding, concurrent execution, and
+baseline strong-model synthesis still require integration. See
+[EXPORT_NOTES.md](EXPORT_NOTES.md) for exact limitations. The working Python
+runner remains `agents/pipeline.py`. The blueprint below remains the target.
 
 Export and validate the actual pipelines before including them in a submission.
 Calling the entire Python runner from one RocketRide node alone would leave
