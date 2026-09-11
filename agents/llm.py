@@ -138,9 +138,8 @@ def load_prompt(name: str) -> str:
 
 @lru_cache(maxsize=32)
 def prompt_hash(name: str) -> str:
-    """sha1(prompt_file)[:8], stored in telemetry so a prompt change is visible
-    in the data rather than only in git (§7.2)."""
-    return hashlib.sha1((PROMPT_DIR / f"{name}.md").read_bytes()).hexdigest()[:8]
+    """Hash the effective prompt, including shared instructions."""
+    return hashlib.sha1(load_prompt(name).encode()).hexdigest()[:8]
 
 
 @lru_cache(maxsize=1)

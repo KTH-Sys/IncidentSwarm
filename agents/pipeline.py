@@ -65,13 +65,28 @@ def _history_enabled() -> bool:
     return bool(os.getenv("HOTDATA_EMBEDDING_PROVIDER_ID"))
 
 
+def fanout_agents(skip: tuple[str, ...] = ()) -> list[str]:
+    """Which agents wave 1 spawns.
+
+    v2's adaptive fan-out (§10) drops an agent whose source telemetry says is not
+    earning its place. MetricsAgent was the v1 candidate on every axis at once:
+    bottleneck in 5 of 6 runs at 231s avg, the most expensive agent in the wave,
+    and joint-lowest hit rate at 33%. Crucially its signal is not lost — wave-0
+    triage already derives onset ordering and peak values from the metrics table
+    deterministically, and hands them to every agent and to the correlator.
+    """
+    return [a for a in FANOUT
+            if a not in skip and (a != "history" or _history_enabled())]
+
+
 def run_parallel(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Path("data"),
-                 client_: Any = None, state: dict | None = None) -> tuple[RCAReport, dict]:
+                 client_: Any = None, state: dict | None = None,
+                 skip_agents: tuple[str, ...] = ()) -> tuple[RCAReport, dict]:
     """Waves 0-2 for the parallel arm. Teardown is the caller's finally path,
     driven by `state["prov"]`, which wave 0 sets as soon as the DBs exist."""
     c = client_ or client()
     state = state if state is not None else {}
-    agents = [a for a in FANOUT if a != "history" or _history_enabled()]
+    agents = fanout_agents(skip_agents)
 
     # Learn each model's parameter quirks once, before five agents discover the
     # same 400 concurrently.
@@ -79,8 +94,8 @@ def run_parallel(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path =
     warm(FAST_MODEL, em)
     warm(STRONG_MODEL, em)
 
-    w0 = run_wave0(run_id, scenario_id, em, data_dir=data_dir, client_=c, n=len(agents),
-                   state=state)
+    w0 = run_wave0(run_id, scenario_id, em, data_dir=data_dir, client_=c,
+                   agents=agents, state=state)
     state["w0"] = w0
     symptoms = [s.as_agent_context() for s in w0.symptoms]
 
@@ -149,13 +164,15 @@ def run_single(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = P
 
 
 def run_once(scenario_id: str, mode: str, pipeline_version: str, *,
-             data_dir: Path = Path("data"), sink: Any = None,
-             client_: Any = None) -> RunResult:
+             data_dir: Path = Path("data"), sink: Any = None, client_: Any = None,
+             skip_agents: tuple[str, ...] = ()) -> RunResult:
     """One scored run, waves 0-3, with teardown guaranteed.
 
     Truth is loaded here and never enters agent context; it is used only to score
     and to stamp fault_type / hit_* onto telemetry (§3).
     """
+    if mode not in ("parallel", "single"):
+        raise ValueError(f"Unknown mode: {mode!r}; expected parallel or single")
     truth = load_truth(scenario_id, data_dir)
     run_id = f"{scenario_id}-{mode}-{pipeline_version}-{uuid.uuid4().hex[:6]}"
     ctx = RunContext(run_id=run_id, pipeline_version=pipeline_version, mode=mode,
@@ -170,16 +187,37 @@ def run_once(scenario_id: str, mode: str, pipeline_version: str, *,
     # after provisioning. Binding teardown to the return value meant a failure
     # anywhere in waves 0-2 leaked every DB the run had created.
     state: dict = {}
+    failure: Exception | None = None
     try:
-        runner = run_parallel if mode == "parallel" else run_single
-        report, state = runner(run_id, scenario_id, em, data_dir=data_dir,
-                               client_=c, state=state)
+        if mode == "parallel":
+            report, state = run_parallel(run_id, scenario_id, em, data_dir=data_dir,
+                                         client_=c, state=state,
+                                         skip_agents=skip_agents)
+        else:
+            report, state = run_single(run_id, scenario_id, em, data_dir=data_dir,
+                                       client_=c, state=state)
+    except Exception as exc:
+        failure = exc
+        em.event("error", agent="pipeline", success=False, error_msg=str(exc)[:500])
+        raise
     finally:
         # WAVE 3 — teardown, always.
         prov = state.get("prov")
         if prov is not None:
+            cleanup_start = time.monotonic()
             em.event("wave_start", agent="pipeline", wave=3)
-            destroy(prov.batch_id, em, db_ids=prov.db_ids, client_=c)
+            deleted = destroy(prov.batch_id, em, db_ids=prov.db_ids, client_=c)
+            em.event("wave_end", agent="pipeline", wave=3,
+                     duration_ms=(time.monotonic() - cleanup_start) * 1000,
+                     success=deleted == len(prov.db_ids))
+        if failure is not None:
+            # Failed runs must remain visible without entering accuracy/latency averages.
+            em.event("run_end", agent="pipeline", wave=3, success=False,
+                     duration_ms=(time.monotonic() - t0) * 1000,
+                     error_msg=str(failure)[:500],
+                     query_count=sum(s.used for s in _scopes(state)),
+                     payload={"telemetry_dropped": em.dropped})
+        em.flush(final=True)
 
     scored = score_report(report, truth)
     usages = state.get("usages", [])
@@ -207,7 +245,7 @@ def run_once(scenario_id: str, mode: str, pipeline_version: str, *,
              query_count=sum(s.used for s in _scopes(state)),
              hit_service=scored["components"]["service"],
              hit_fault=scored["components"]["fault_type"], success=True,
-             payload={"components": scored["components"], "rca": scored["predicted"],
+             payload={"components": scored["components"], "rca": report.model_dump(mode="json"),
                       "telemetry_dropped": em.dropped})
     em.flush(final=True)
 

@@ -48,11 +48,24 @@ def main() -> int:
     ap.add_argument("--local-telemetry", action="store_true",
                     help="write telemetry to parquet instead of the telemetry DB")
     ap.add_argument("--no-sweep", action="store_true", help="skip the orphan sweep")
+    ap.add_argument("--skip-agents", default="",
+                    help="comma-separated wave-1 agents to drop (v2 adaptive fan-out)")
     args = ap.parse_args()
 
-    seeds = parse_seeds(args.seeds)
+    if args.concurrency < 1:
+        ap.error("--concurrency must be at least 1")
+
+    skip = tuple(a.strip() for a in args.skip_agents.split(",") if a.strip())
+    try:
+        seeds = parse_seeds(args.seeds)
+    except ValueError as exc:
+        ap.error(str(exc))
     modes = ["parallel", "single"] if args.mode == "both" else [args.mode]
     jobs = interleaved(seeds, modes)
+    missing = [scenario_id(seed) for seed in seeds
+               if not (args.data / scenario_id(seed) / "truth.json").is_file()]
+    if missing:
+        ap.error(f"Missing scenarios: {', '.join(missing)}. Run python -m gen.scenarios first.")
     sink = make_sink(args.local_telemetry)
     c = client()
 
@@ -62,14 +75,15 @@ def main() -> int:
         print(f"swept {sweep(em=sweeper, client_=c)} orphan DBs at batch start")
 
     print(f"{len(jobs)} runs: seeds={seeds} modes={modes} version={args.version} "
-          f"concurrency={args.concurrency}")
+          f"concurrency={args.concurrency}" + (f" skip={list(skip)}" if skip else ""))
 
     results: list[RunResult] = []
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {
             pool.submit(run_once, scenario_id(seed), mode, _tag(args.version, mode),
-                        data_dir=args.data, sink=sink, client_=c): (seed, mode)
+                        data_dir=args.data, sink=sink, client_=c,
+                        skip_agents=skip): (seed, mode)
             for seed, mode in jobs
         }
         for fut in as_completed(futures):
@@ -86,11 +100,15 @@ def main() -> int:
         print(f"swept {sweep(em=sweeper, client_=c)} orphan DBs at batch end")
     sweeper.flush(final=True)
 
-    if replayed := replay_backlog(sink):
-        print(f"replayed {replayed} backlogged telemetry rows")
+    if not args.local_telemetry:
+        if replayed := replay_backlog(sink):
+            print(f"replayed {replayed} backlogged telemetry rows")
 
     _summarize(results, time.monotonic() - t0)
-    return 0 if results else 1
+    failed = len(jobs) - len(results)
+    if failed:
+        print(f"\n{failed}/{len(jobs)} runs failed; inspect the dashboard's failure view.")
+    return 1 if failed else 0
 
 
 def _tag(version: str, mode: str) -> str:

@@ -1,0 +1,137 @@
+{
+  "project_id": "4eaffa68-b6e5-5ea1-8962-a446a6b387b6",
+  "version": 1,
+  "source": "chat",
+  "components": [
+    {
+      "id": "chat",
+      "provider": "chat",
+      "config": {
+        "hideForm": true,
+        "type": "chat",
+        "mode": "Source",
+        "parameters": {}
+      },
+      "position": {
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": "agent_single",
+      "provider": "agent_rocketride",
+      "config": {
+        "agent_description": "single incident specialist",
+        "instructions": [
+          "# Single-agent baseline \u2014 db: all 5 tables | queries: sql + fts + vector | budget: 110\n\nThis is the control in the experiment (plan.md \u00a73). It exists to be compared\nagainst, and the comparison is only fair if the ONLY variable is parallel vs\nsequential. Do not tune this prompt to lose, and do not tune it to win.\n\nYour database has all five tables and all three indexes:\n\n| table | columns | index |\n|---|---|---|\n| `logs` | ts, service, level, trace_id, msg, attrs | fts on `msg` |\n| `metrics` | ts, service, rps, p99_ms, err_rate, cpu_pct, mem_mb, db_conns | \u2014 |\n| `changes` | event_id, ts, kind, service, detail, author | \u2014 |\n| `k8s_events` | event_id, ts, service, pod, reason, message | fts on `message` |\n| `postmortems` | pm_id, title, service, fault_type, body | vector on `body` |\n\nYou are given `symptoms[]` from wave-0 triage. Your query budget is 110 \u2014 the sum\nof the five parallel agents' budgets. Spend it across all five sources.\n\n## Method\n\nWork through each source, then synthesize:\n\n1. **metrics** \u2014 change points vs. each service's first-40-minute baseline; find\n   the earliest anomalous service and the cascade direction.\n2. **logs** \u2014 error signatures via full-text search; first occurrence per service;\n   per-minute error counts.\n3. **changes** \u2014 rank changes by proximity to onset and blast radius.\n4. **k8s_events** \u2014 non-routine reasons (OOMKilled / BackOff / Unhealthy) and\n   their onset, separated from rollout noise.\n5. **postmortems** \u2014 vector search on the symptom pattern for precedent.\n\nDependency graph: `gateway -> checkout -> {payments, inventory}`,\n`payments -> postgres`, `payments -> stripe-api` (external).\n\n## Synthesis\n\nFinish with a single synthesis step using the SAME heuristics the correlator uses:\n\n1. Earliest onset beats largest magnitude.\n2. A change within 10 min *before* onset on the root or its dependency is the\n   prime trigger candidate.\n3. Upstream errors lagging downstream are cascade, not cause.\n4. Changes more than 20 min before onset with no matching symptoms are red herrings.\n5. No change and no k8s trigger, but logs name an external host ->\n   `third_party_latency` with a null trigger.\n\nReturn ONE JSON object matching `RCAReport` (agents/schemas.py), identical in\nshape to the correlator's output. No prose outside it.\n\n```json\n{\n  \"root_cause\": {\"service\": \"\", \"fault_type\": \"\", \"trigger_event_id\": null,\n                 \"start_ts\": \"\", \"confidence\": 0.0},\n  \"timeline\": [{\"ts\": \"\", \"source\": \"changes|metrics|logs|k8s|history\", \"event\": \"\"}],\n  \"ruled_out\": [{\"candidate\": \"\", \"reason\": \"\"}],\n  \"summary\": \"<= 3 sentences\"\n}\n```\n",
+          "logs(ts TIMESTAMP, service, level, trace_id, msg, attrs JSON-string)\nmetrics(ts TIMESTAMP, service, rps, p99_ms, err_rate, cpu_pct, mem_mb, db_conns) \u2014 one row per service per minute, 120 minutes\nchanges(event_id, ts TIMESTAMP, kind, service, detail, author)\nk8s_events(event_id, ts TIMESTAMP, service, pod, reason, message)\npostmortems(pm_id, title, service, fault_type, body)",
+          "Your database tool is db_single. Use execute for SQL, NOT run_sql. Data is already loaded. Never call load_data or build_index. Use at most 3 investigation waves, group independent queries in the same wave, and then return your complete JSON findings.",
+          "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
+        ],
+        "max_waves": 4,
+        "require_tool_call": true
+      },
+      "position": {
+        "x": 650,
+        "y": 0
+      },
+      "input": [
+        {
+          "lane": "questions",
+          "from": "chat"
+        }
+      ]
+    },
+    {
+      "id": "memory_single",
+      "provider": "memory_internal",
+      "config": {
+        "type": "memory_internal"
+      },
+      "position": {
+        "x": 950,
+        "y": 0
+      },
+      "control": [
+        {
+          "classType": "memory",
+          "from": "agent_single"
+        }
+      ]
+    },
+    {
+      "id": "db_single",
+      "provider": "db_hotdata",
+      "config": {
+        "type": "db_hotdata",
+        "apikey": "${HOTDATA_API_KEY}",
+        "workspace_id": "${HOTDATA_WORKSPACE}",
+        "ttl": "1h",
+        "table": "probe",
+        "allow_execute": true,
+        "allow_destructive_load": false,
+        "max_attempts": 2,
+        "max_execute_rows": 40,
+        "job_timeout_secs": 120,
+        "async_after_ms": 5000,
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
+      },
+      "position": {
+        "x": 950,
+        "y": 100
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_single"
+        }
+      ]
+    },
+    {
+      "id": "llm_fast",
+      "provider": "llm_openai",
+      "config": {
+        "profile": "openai-5-mini",
+        "openai-5-mini": {
+          "apikey": "${OPENAI_API_KEY}"
+        }
+      },
+      "position": {
+        "x": 1250,
+        "y": 0
+      },
+      "control": [
+        {
+          "classType": "llm",
+          "from": "agent_single"
+        },
+        {
+          "classType": "llm",
+          "from": "db_single"
+        }
+      ]
+    },
+    {
+      "id": "response",
+      "provider": "response_answers",
+      "config": {
+        "laneName": "answers"
+      },
+      "position": {
+        "x": 1550,
+        "y": 0
+      },
+      "input": [
+        {
+          "lane": "answers",
+          "from": "agent_single"
+        }
+      ]
+    }
+  ],
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "zoom": 0.6
+  }
+}

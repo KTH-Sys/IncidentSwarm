@@ -1,13 +1,14 @@
 # Pipeline spec — what to build in RocketRide Cloud
 
-The `.pipe` files themselves are **exported from RocketRide Cloud** during
-packaging (plan.md §11, 15:00–15:20) and are part of the submission. This file is
-the blueprint to build them from, and the contract the Python side already
-implements.
+**Status: planned integration.** No exported `.pipe` files or RocketRide runtime
+calls are present in this repository. The runnable implementation is
+`agents/pipeline.py`, which uses Python threads for fan-out. This document is a
+blueprint for wiring those functions into RocketRide after verifying the node
+and runtime-value contracts with the sponsor.
 
-Both pipelines are already runnable headless — `agents/pipeline.py` implements
-waves 0–3 exactly as described below — so RocketRide orchestrates the same
-functions rather than a reimplementation.
+Export and validate the actual pipelines before including them in a submission.
+Calling the entire Python runner from one RocketRide node alone would leave
+fan-out in Python; it would not demonstrate RocketRide orchestrating the agents.
 
 ## `incident_parallel.pipe`
 
@@ -18,7 +19,7 @@ Webhook trigger. Payload: `{run_id, scenario_id, mode: "parallel", pipeline_vers
 | 0 | Provision + triage | Bulk-create 5 DBs, load one slice each, index, triage SQL → `symptoms[]` | `agents.wave0.run_wave0` |
 | 1 | Fan-out ×5 (concurrent) | LogAgent, MetricsAgent, ChangeAgent, InfraAgent, HistoryAgent — each gets **only** its own `db_id` + `symptoms[]` | `agents.agent.run_agent` |
 | 2 | Correlator | Merge 5 HypothesisSets + symptoms → RCAReport | `agents.correlator.run_correlator` |
-| 3 | Teardown + score | `delete_database_batch`, score vs truth, flush telemetry | `agents.pipeline.run_once` finally path |
+| 3 | Teardown + score | Delete each DB, cancel creation batch, score vs truth, flush telemetry | Lifecycle adapter around `agents.hotdata_scope.destroy` and `bench.score.score_report` |
 
 Wave 1 must run its five agents **concurrently** — that is the claim being
 judged. Each agent node receives exactly two runtime values:
@@ -47,11 +48,18 @@ correlator prompt**.
 | 0 | Provision 1 DB, load all 5 tables, index, triage | `agents.pipeline.run_single` |
 | 1 | Single agent, budget 110 | `agents.baseline.run_baseline` |
 | 2 | Synthesis (strong model, correlator prompt) | inside `run_baseline` |
-| 3 | Teardown + score | `agents.pipeline.run_once` finally path |
+| 3 | Teardown + score | Lifecycle adapter around `agents.hotdata_scope.destroy` and `bench.score.score_report` |
 
-The only variable that differs between the two pipelines is parallel vs
-sequential. Same models, same total budget, same correlator prompt, same
-scenarios, same scoring.
+Both arms use the same model tiers, correlator prompt, scenarios, and scoring.
+They differ in specialist prompts, context, and reasoning-turn limits. Without
+an embedding provider, the Python parallel arm uses four agents and 100 queries;
+the baseline retains five tables and 110 queries. These are benchmark limitations,
+not a controlled concurrency-only comparison.
+
+The Python functions above are implementation references, not ready-made node
+adapters: `run_once` owns the entire lifecycle, and `run_single` includes loading,
+investigation, and synthesis. A RocketRide integration must split these steps
+without executing them twice and must preserve cleanup when any wave fails.
 
 ## Telemetry contract
 

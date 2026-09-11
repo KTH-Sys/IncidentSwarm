@@ -1,0 +1,433 @@
+{
+  "project_id": "ff63e44f-b10b-5e5f-be83-bcd056d85683",
+  "version": 1,
+  "source": "chat",
+  "components": [
+    {
+      "id": "chat",
+      "provider": "chat",
+      "config": {
+        "hideForm": true,
+        "type": "chat",
+        "mode": "Source",
+        "parameters": {}
+      },
+      "position": {
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": "coordinator",
+      "provider": "agent_rocketride",
+      "config": {
+        "agent_description": "Parallel incident commander",
+        "instructions": [
+          "Coordinate incident investigation. Your FIRST execution wave MUST invoke all four specialist run_agent tools together in ONE tool_calls array. Do not call specialists sequentially.",
+          "Pass the same symptom summary to each specialist. Specialists have isolated databases. Collect all four results before answering. Never invent a missing tool result.",
+          "Return bare JSON with two keys: findings (array of the four HypothesisSet results) and report (RCAReport). Use memory references to include complete specialist results.",
+          "# Correlator (wave 2, strong model)\n\nYou receive five `HypothesisSet` objects \u2014 one each from the logs, metrics,\nchanges, infra, and history agents \u2014 plus the wave-0 `symptoms[]` list. You have\nno database access. Merge them into one `RCAReport`.\n\n## Heuristics (apply in this order)\n\n1. **Earliest onset beats largest magnitude.** The service that broke first is a\n   better root-cause candidate than the one that broke worst.\n2. **A change within 10 minutes *before* onset**, on the root service or its\n   dependency, is the prime trigger candidate.\n3. **Upstream errors lagging downstream are cascade, not cause.** If gateway's\n   error rise trails payments by a minute or two, payments is the cause and\n   gateway is a symptom.\n4. **Changes more than 20 minutes before onset with no matching symptoms are red\n   herrings.** Put them in `ruled_out` with the reason.\n5. **If there is no change and no k8s trigger, and the logs name an external\n   host**, use `third_party_latency` with a `null` `trigger_event_id`.\n\nDependency graph: `gateway -> checkout -> {payments, inventory}`,\n`payments -> postgres`, `payments -> stripe-api` (external).\n\n## Output\n\nReturn ONE JSON object matching `RCAReport` (agents/schemas.py). No prose outside it.\n\n```json\n{\n  \"root_cause\": {\"service\": \"\", \"fault_type\": \"\", \"trigger_event_id\": null,\n                 \"start_ts\": \"\", \"confidence\": 0.0},\n  \"timeline\": [{\"ts\": \"\", \"source\": \"changes|metrics|logs|k8s|history\", \"event\": \"\"}],\n  \"ruled_out\": [{\"candidate\": \"\", \"reason\": \"\"}],\n  \"summary\": \"<= 3 sentences\"\n}\n```\n\n- `timeline` is ordered earliest first and cites which source each entry came from.\n- `ruled_out` must name every red herring an agent proposed, with why you dropped it.\n- Prefer `unknown` over a confident wrong answer when the agents genuinely conflict.\n"
+        ],
+        "max_waves": 5,
+        "require_tool_call": true
+      },
+      "position": {
+        "x": 300,
+        "y": 0
+      },
+      "input": [
+        {
+          "lane": "questions",
+          "from": "chat"
+        }
+      ]
+    },
+    {
+      "id": "memory_coordinator",
+      "provider": "memory_internal",
+      "config": {
+        "type": "memory_internal"
+      },
+      "position": {
+        "x": 300,
+        "y": 250
+      },
+      "control": [
+        {
+          "classType": "memory",
+          "from": "coordinator"
+        }
+      ]
+    },
+    {
+      "id": "llm_strong",
+      "provider": "llm_openai",
+      "config": {
+        "profile": "openai-5",
+        "openai-5": {
+          "apikey": "${OPENAI_API_KEY}"
+        }
+      },
+      "position": {
+        "x": 300,
+        "y": -250
+      },
+      "control": [
+        {
+          "classType": "llm",
+          "from": "coordinator"
+        }
+      ]
+    },
+    {
+      "id": "agent_logs",
+      "provider": "agent_rocketride",
+      "config": {
+        "agent_description": "logs incident specialist",
+        "instructions": [
+          "# LogAgent (wave 1) \u2014 db: logs only | queries: sql + fts | budget: 40\n\nYour database has ONE table, `logs`: `ts`, `service`, `level`, `trace_id`, `msg`\n(full-text indexed), `attrs` (JSON string: status, latency_ms, route).\n\nYou are given `symptoms[]` from wave-0 triage: services whose err_rate or p99 is\n>= 3x baseline. You do not know the root cause.\n\n## Your job\n\n1. **Error signatures.** Full-text search `msg` for the distinctive exception or\n   timeout text. Quote the exact string you find.\n2. **First occurrence per service.** For each symptom service, the earliest ts\n   where its error signature appears. This ordering is the most valuable thing\n   you produce \u2014 the earliest service is the likely root, not the loudest.\n3. **Per-minute error counts.** `level = 'ERROR'` grouped by service and minute,\n   so the correlator can see onset shape and which service leads.\n\n## Notes\n\n- `logs` is ~200k rows. Aggregate in SQL; never select raw rows in bulk.\n- A `trace_id` appearing across services shows the request path \u2014 useful for\n  telling a caller's timeout apart from a callee's failure.\n- Text you might find: `NullPointerException in ChargeHandler`,\n  `timeout acquiring connection from pool`, `pricing fallback after timeout`,\n  `stripe-api upstream timeout 504`, `GC overhead limit`, `slow request`.\n- You cannot see change events or k8s events. Leave `trigger_event_id` null.\n\n<!-- Included by every wave-1 agent prompt. Keep edits here, not duplicated. -->\n\n## Output contract\n\nReturn ONE JSON object matching `HypothesisSet` (agents/schemas.py). No prose\noutside the JSON, no markdown fence.\n\n```json\n{\n  \"agent\": \"<your agent name>\",\n  \"hypotheses\": [\n    {\n      \"service\": \"payments\",\n      \"fault_type\": \"pool_exhaustion\",\n      \"trigger_event_id\": null,\n      \"start_ts\": \"2026-09-11T14:03:00Z\",\n      \"confidence\": 0.72,\n      \"evidence\": [\"payments p99 212ms->2140ms at 14:03\", \"db_conns flat at 10 from 14:03\"]\n    }\n  ],\n  \"queries_used\": 23,\n  \"notes\": \"gateway error rise lags payments by 2 min, which looks like cascade\"\n}\n```\n\nRules:\n- 1-3 hypotheses, sorted by confidence descending.\n- `fault_type` is one of: `bad_deploy`, `flag_flip`, `pool_exhaustion`,\n  `cpu_throttle`, `third_party_latency`, `memory_leak`, `unknown`.\n- Set ONLY the fields your own source can support. If your source cannot see\n  change events, leave `trigger_event_id` null \u2014 do not guess it.\n- `evidence` must quote concrete values you actually queried. No evidence you did\n  not observe.\n- You can see only your own database. You do not know what the other agents found.\n\n",
+          "logs(ts TIMESTAMP, service, level, trace_id, msg, attrs JSON-string)",
+          "Your database tool is db_logs. Use execute for SQL, NOT run_sql. Data is already loaded. Never call load_data or build_index. Use at most 3 investigation waves, group independent queries in the same wave, and then return your complete JSON findings.",
+          "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
+        ],
+        "max_waves": 4,
+        "require_tool_call": true
+      },
+      "position": {
+        "x": 650,
+        "y": 0
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "coordinator"
+        }
+      ]
+    },
+    {
+      "id": "memory_logs",
+      "provider": "memory_internal",
+      "config": {
+        "type": "memory_internal"
+      },
+      "position": {
+        "x": 950,
+        "y": 0
+      },
+      "control": [
+        {
+          "classType": "memory",
+          "from": "agent_logs"
+        }
+      ]
+    },
+    {
+      "id": "db_logs",
+      "provider": "db_hotdata",
+      "config": {
+        "type": "db_hotdata",
+        "apikey": "${HOTDATA_API_KEY}",
+        "workspace_id": "${HOTDATA_WORKSPACE}",
+        "ttl": "1h",
+        "table": "logs",
+        "allow_execute": true,
+        "allow_destructive_load": false,
+        "max_attempts": 2,
+        "max_execute_rows": 40,
+        "job_timeout_secs": 120,
+        "async_after_ms": 5000,
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
+      },
+      "position": {
+        "x": 950,
+        "y": 100
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_logs"
+        }
+      ]
+    },
+    {
+      "id": "agent_metrics",
+      "provider": "agent_rocketride",
+      "config": {
+        "agent_description": "metrics incident specialist",
+        "instructions": [
+          "# MetricsAgent (wave 1) \u2014 db: metrics only | queries: sql | budget: 30\n\nYour database has ONE table, `metrics`, sampled once per minute over a 120-minute\nwindow: `ts`, `service`, `rps`, `p99_ms`, `err_rate`, `cpu_pct`, `mem_mb`,\n`db_conns` (payments pool and postgres; null elsewhere).\n\nYou are given `symptoms[]` from wave-0 triage.\n\n## Your job\n\n1. **Change points.** For each service and each of err_rate, p99_ms, cpu_pct,\n   mem_mb, db_conns: compare against that service's own first-40-minute baseline.\n   Report the first minute where it departs materially, with both values.\n2. **Earliest anomalous service.** Rank services by that change-point time. The\n   earliest is your primary hypothesis.\n3. **Cascade direction.** For each pair of dependent services, state which one\n   moved first and by how many minutes. Call out any service whose rise *lags*\n   another's \u2014 say so in `notes`; it is a symptom, not a cause.\n\n## Signatures to distinguish\n\n| pattern | suggests |\n|---|---|\n| err_rate 8-15%, step change | `bad_deploy` |\n| p99 x3, err_rate ~2% | `flag_flip` |\n| db_conns pinned flat at a ceiling, p99 x10 | `pool_exhaustion` |\n| cpu_pct >= 97%, p99 x4 | `cpu_throttle` |\n| p99 ramping ~x6 over 10 min | `third_party_latency` |\n| mem_mb linear ramp, sawtooth after restarts | `memory_leak` |\n\n## Notes\n\n- A flat-topped series is a ceiling, not noise \u2014 that is a limit being hit.\n- You cannot see changes, logs, or k8s events. Leave `trigger_event_id` null.\n\n<!-- Included by every wave-1 agent prompt. Keep edits here, not duplicated. -->\n\n## Output contract\n\nReturn ONE JSON object matching `HypothesisSet` (agents/schemas.py). No prose\noutside the JSON, no markdown fence.\n\n```json\n{\n  \"agent\": \"<your agent name>\",\n  \"hypotheses\": [\n    {\n      \"service\": \"payments\",\n      \"fault_type\": \"pool_exhaustion\",\n      \"trigger_event_id\": null,\n      \"start_ts\": \"2026-09-11T14:03:00Z\",\n      \"confidence\": 0.72,\n      \"evidence\": [\"payments p99 212ms->2140ms at 14:03\", \"db_conns flat at 10 from 14:03\"]\n    }\n  ],\n  \"queries_used\": 23,\n  \"notes\": \"gateway error rise lags payments by 2 min, which looks like cascade\"\n}\n```\n\nRules:\n- 1-3 hypotheses, sorted by confidence descending.\n- `fault_type` is one of: `bad_deploy`, `flag_flip`, `pool_exhaustion`,\n  `cpu_throttle`, `third_party_latency`, `memory_leak`, `unknown`.\n- Set ONLY the fields your own source can support. If your source cannot see\n  change events, leave `trigger_event_id` null \u2014 do not guess it.\n- `evidence` must quote concrete values you actually queried. No evidence you did\n  not observe.\n- You can see only your own database. You do not know what the other agents found.\n\n",
+          "metrics(ts TIMESTAMP, service, rps, p99_ms, err_rate, cpu_pct, mem_mb, db_conns) \u2014 one row per service per minute, 120 minutes",
+          "Your database tool is db_metrics. Use execute for SQL, NOT run_sql. Data is already loaded. Never call load_data or build_index. Use at most 3 investigation waves, group independent queries in the same wave, and then return your complete JSON findings.",
+          "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
+        ],
+        "max_waves": 4,
+        "require_tool_call": true
+      },
+      "position": {
+        "x": 650,
+        "y": 300
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "coordinator"
+        }
+      ]
+    },
+    {
+      "id": "memory_metrics",
+      "provider": "memory_internal",
+      "config": {
+        "type": "memory_internal"
+      },
+      "position": {
+        "x": 950,
+        "y": 300
+      },
+      "control": [
+        {
+          "classType": "memory",
+          "from": "agent_metrics"
+        }
+      ]
+    },
+    {
+      "id": "db_metrics",
+      "provider": "db_hotdata",
+      "config": {
+        "type": "db_hotdata",
+        "apikey": "${HOTDATA_API_KEY}",
+        "workspace_id": "${HOTDATA_WORKSPACE}",
+        "ttl": "1h",
+        "table": "metrics",
+        "allow_execute": true,
+        "allow_destructive_load": false,
+        "max_attempts": 2,
+        "max_execute_rows": 40,
+        "job_timeout_secs": 120,
+        "async_after_ms": 5000,
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
+      },
+      "position": {
+        "x": 950,
+        "y": 400
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_metrics"
+        }
+      ]
+    },
+    {
+      "id": "agent_changes",
+      "provider": "agent_rocketride",
+      "config": {
+        "agent_description": "changes incident specialist",
+        "instructions": [
+          "# ChangeAgent (wave 1) \u2014 db: changes only | queries: sql | budget: 15\n\nYour database has ONE table, `changes`: `event_id` (`chg_####`), `ts`, `kind`\n(deploy / flag / config), `service`, `detail`, `author`.\n\nYou are given `symptoms[]` from wave-0 triage, including onset times.\n\n## Your job\n\nRank EVERY change by two factors, and report the top candidates:\n\n1. **Proximity to symptom onset.** A change 0-10 minutes *before* onset is a\n   strong candidate. A change *after* onset cannot be the cause. A change more\n   than 20 minutes before onset with no matching symptom is a red herring.\n2. **Blast radius.** A change on a symptom service, or on something a symptom\n   service depends on, outranks a change on an unrelated service.\n\nDependency graph: `gateway -> checkout -> {payments, inventory}`,\n`payments -> postgres`, `payments -> stripe-api` (external).\n\n## You are the only agent that can name a trigger\n\nSet `trigger_event_id` to the `chg_####` you believe fired the incident. If the\nbest candidate is weak \u2014 nothing within 20 minutes, or nothing touching a symptom\nservice \u2014 say so in `notes` and leave it null rather than forcing one. An\nincident with no change at all is a real outcome (external latency, gradual leak).\n\nMap `detail` to a fault type where it is unambiguous: a version bump ->\n`bad_deploy`, a flag turning on -> `flag_flip`, a pool or limit being lowered ->\n`pool_exhaustion`. Otherwise `unknown`.\n\n<!-- Included by every wave-1 agent prompt. Keep edits here, not duplicated. -->\n\n## Output contract\n\nReturn ONE JSON object matching `HypothesisSet` (agents/schemas.py). No prose\noutside the JSON, no markdown fence.\n\n```json\n{\n  \"agent\": \"<your agent name>\",\n  \"hypotheses\": [\n    {\n      \"service\": \"payments\",\n      \"fault_type\": \"pool_exhaustion\",\n      \"trigger_event_id\": null,\n      \"start_ts\": \"2026-09-11T14:03:00Z\",\n      \"confidence\": 0.72,\n      \"evidence\": [\"payments p99 212ms->2140ms at 14:03\", \"db_conns flat at 10 from 14:03\"]\n    }\n  ],\n  \"queries_used\": 23,\n  \"notes\": \"gateway error rise lags payments by 2 min, which looks like cascade\"\n}\n```\n\nRules:\n- 1-3 hypotheses, sorted by confidence descending.\n- `fault_type` is one of: `bad_deploy`, `flag_flip`, `pool_exhaustion`,\n  `cpu_throttle`, `third_party_latency`, `memory_leak`, `unknown`.\n- Set ONLY the fields your own source can support. If your source cannot see\n  change events, leave `trigger_event_id` null \u2014 do not guess it.\n- `evidence` must quote concrete values you actually queried. No evidence you did\n  not observe.\n- You can see only your own database. You do not know what the other agents found.\n\n",
+          "changes(event_id, ts TIMESTAMP, kind, service, detail, author)",
+          "Your database tool is db_changes. Use execute for SQL, NOT run_sql. Data is already loaded. Never call load_data or build_index. Use at most 3 investigation waves, group independent queries in the same wave, and then return your complete JSON findings.",
+          "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
+        ],
+        "max_waves": 4,
+        "require_tool_call": true
+      },
+      "position": {
+        "x": 650,
+        "y": 600
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "coordinator"
+        }
+      ]
+    },
+    {
+      "id": "memory_changes",
+      "provider": "memory_internal",
+      "config": {
+        "type": "memory_internal"
+      },
+      "position": {
+        "x": 950,
+        "y": 600
+      },
+      "control": [
+        {
+          "classType": "memory",
+          "from": "agent_changes"
+        }
+      ]
+    },
+    {
+      "id": "db_changes",
+      "provider": "db_hotdata",
+      "config": {
+        "type": "db_hotdata",
+        "apikey": "${HOTDATA_API_KEY}",
+        "workspace_id": "${HOTDATA_WORKSPACE}",
+        "ttl": "1h",
+        "table": "changes",
+        "allow_execute": true,
+        "allow_destructive_load": false,
+        "max_attempts": 2,
+        "max_execute_rows": 40,
+        "job_timeout_secs": 120,
+        "async_after_ms": 5000,
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
+      },
+      "position": {
+        "x": 950,
+        "y": 700
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_changes"
+        }
+      ]
+    },
+    {
+      "id": "agent_infra",
+      "provider": "agent_rocketride",
+      "config": {
+        "agent_description": "infra incident specialist",
+        "instructions": [
+          "# InfraAgent (wave 1) \u2014 db: k8s_events only | queries: sql + fts | budget: 15\n\nYour database has ONE table, `k8s_events`: `event_id` (`k8s_####`), `ts`,\n`service`, `pod`, `reason` (Scheduled / Killing / Unhealthy / OOMKilled /\nBackOff), `message` (full-text indexed).\n\nYou are given `symptoms[]` from wave-0 triage.\n\n## Your job\n\n1. **Separate signal from rollout noise.** `Scheduled` and `Killing` in a normal\n   rolling pattern are routine. `OOMKilled`, `BackOff`, and `Unhealthy` are not.\n2. **Onset.** For each non-routine reason, the earliest `ts` per service. That\n   first event is the trigger candidate.\n3. **Restart counting.** Repeated `Killing` + `Scheduled` on one pod is a crash\n   loop \u2014 report the cadence.\n\n## Mapping\n\n- `OOMKilled`, especially with `BackOff` restarts -> `memory_leak`; the first\n  `OOMKilled` event_id is the trigger.\n- `Unhealthy: readiness probe failed` -> `cpu_throttle`; the first `Unhealthy`\n  event_id is the trigger.\n- Only routine `Scheduled`/`Killing` -> report no infra signal. Say so plainly,\n  with an empty or low-confidence hypothesis list. A clean \"nothing here\" is a\n  useful result, not a failure.\n\nYou may set `trigger_event_id` to a `k8s_####` id when the fault is one of the\ntwo above. You cannot see metrics, logs, or deploys.\n\n<!-- Included by every wave-1 agent prompt. Keep edits here, not duplicated. -->\n\n## Output contract\n\nReturn ONE JSON object matching `HypothesisSet` (agents/schemas.py). No prose\noutside the JSON, no markdown fence.\n\n```json\n{\n  \"agent\": \"<your agent name>\",\n  \"hypotheses\": [\n    {\n      \"service\": \"payments\",\n      \"fault_type\": \"pool_exhaustion\",\n      \"trigger_event_id\": null,\n      \"start_ts\": \"2026-09-11T14:03:00Z\",\n      \"confidence\": 0.72,\n      \"evidence\": [\"payments p99 212ms->2140ms at 14:03\", \"db_conns flat at 10 from 14:03\"]\n    }\n  ],\n  \"queries_used\": 23,\n  \"notes\": \"gateway error rise lags payments by 2 min, which looks like cascade\"\n}\n```\n\nRules:\n- 1-3 hypotheses, sorted by confidence descending.\n- `fault_type` is one of: `bad_deploy`, `flag_flip`, `pool_exhaustion`,\n  `cpu_throttle`, `third_party_latency`, `memory_leak`, `unknown`.\n- Set ONLY the fields your own source can support. If your source cannot see\n  change events, leave `trigger_event_id` null \u2014 do not guess it.\n- `evidence` must quote concrete values you actually queried. No evidence you did\n  not observe.\n- You can see only your own database. You do not know what the other agents found.\n\n",
+          "k8s_events(event_id, ts TIMESTAMP, service, pod, reason, message)",
+          "Your database tool is db_infra. Use execute for SQL, NOT run_sql. Data is already loaded. Never call load_data or build_index. Use at most 3 investigation waves, group independent queries in the same wave, and then return your complete JSON findings.",
+          "Search SQL uses SELECT * FROM bm25_search('logs', 'msg', 'query') LIMIT 20. Prefer SQL aggregation, and use LIKE if search is unavailable."
+        ],
+        "max_waves": 4,
+        "require_tool_call": true
+      },
+      "position": {
+        "x": 650,
+        "y": 900
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "coordinator"
+        }
+      ]
+    },
+    {
+      "id": "memory_infra",
+      "provider": "memory_internal",
+      "config": {
+        "type": "memory_internal"
+      },
+      "position": {
+        "x": 950,
+        "y": 900
+      },
+      "control": [
+        {
+          "classType": "memory",
+          "from": "agent_infra"
+        }
+      ]
+    },
+    {
+      "id": "db_infra",
+      "provider": "db_hotdata",
+      "config": {
+        "type": "db_hotdata",
+        "apikey": "${HOTDATA_API_KEY}",
+        "workspace_id": "${HOTDATA_WORKSPACE}",
+        "ttl": "1h",
+        "table": "k8s_events",
+        "allow_execute": true,
+        "allow_destructive_load": false,
+        "max_attempts": 2,
+        "max_execute_rows": 40,
+        "job_timeout_secs": 120,
+        "async_after_ms": 5000,
+        "db_description": "Read-only incident evidence. Never modify or load data during investigation."
+      },
+      "position": {
+        "x": 950,
+        "y": 1000
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_infra"
+        }
+      ]
+    },
+    {
+      "id": "llm_fast",
+      "provider": "llm_openai",
+      "config": {
+        "profile": "openai-5-mini",
+        "openai-5-mini": {
+          "apikey": "${OPENAI_API_KEY}"
+        }
+      },
+      "position": {
+        "x": 1250,
+        "y": 0
+      },
+      "control": [
+        {
+          "classType": "llm",
+          "from": "agent_logs"
+        },
+        {
+          "classType": "llm",
+          "from": "db_logs"
+        },
+        {
+          "classType": "llm",
+          "from": "agent_metrics"
+        },
+        {
+          "classType": "llm",
+          "from": "db_metrics"
+        },
+        {
+          "classType": "llm",
+          "from": "agent_changes"
+        },
+        {
+          "classType": "llm",
+          "from": "db_changes"
+        },
+        {
+          "classType": "llm",
+          "from": "agent_infra"
+        },
+        {
+          "classType": "llm",
+          "from": "db_infra"
+        }
+      ]
+    },
+    {
+      "id": "response",
+      "provider": "response_answers",
+      "config": {
+        "laneName": "answers"
+      },
+      "position": {
+        "x": 1550,
+        "y": 0
+      },
+      "input": [
+        {
+          "lane": "answers",
+          "from": "coordinator"
+        }
+      ]
+    }
+  ],
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "zoom": 0.6
+  }
+}

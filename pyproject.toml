@@ -14,6 +14,7 @@ dependencies = [
     "streamlit>=1.36",
     "python-dotenv>=1.0",
     "openai>=3.13.0",
+    "rocketride>=1.3",
 ]
 
 [project.optional-dependencies]
@@ -26,11 +27,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["agents", "bench", "gen", "telemetry"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"config.py" = "config.py"
+
 [tool.ruff]
 line-length = 100
 
 [tool.pytest.ini_options]
-testpaths = ["bench"]
+testpaths = ["tests", "bench"]
 
 [dependency-groups]
 dev = [

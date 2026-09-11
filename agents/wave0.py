@@ -155,7 +155,7 @@ def slice_path(scenario_id: str, agent: str, data_dir: Path) -> Path:
 
 
 def run_wave0(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Path("data"),
-              client_: Any = None, n: int = len(FANOUT),
+              client_: Any = None, agents: list[str] | None = None,
               state: dict | None = None) -> Wave0Result:
     """Provision, load slices, index, triage. Returns db_ids + symptoms[].
 
@@ -163,10 +163,11 @@ def run_wave0(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Pa
     destroy(result.prov.batch_id) from a finally path (§8).
     """
     c = client_ or client()
+    agents = list(agents if agents is not None else FANOUT)
     t0 = time.monotonic()
     em.event("wave_start", agent="pipeline", wave=0)
 
-    prov = provision(run_id, n, em, client_=c)
+    prov = provision(run_id, len(agents), em, client_=c)
     # Register the moment the DBs exist, so a failure in load or index still
     # reaches teardown. Anything set after this point is too late.
     if state is not None:
@@ -174,7 +175,7 @@ def run_wave0(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Pa
 
     # Each DB gets exactly one slice. FANOUT order maps agent -> db_ids[i].
     scoped: dict[str, ScopedDB] = {}
-    for i, agent in enumerate(FANOUT[:n]):
+    for i, agent in enumerate(agents):
         db_id = prov.db_ids[i]
         table = SLICES[agent]["table"]
         loaded = load(db_id, table, slice_path(scenario_id, agent, data_dir), em, client_=c)
@@ -183,7 +184,17 @@ def run_wave0(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Pa
         scoped[agent] = ScopedDB(agent=agent, db_id=db_id,
                                  budget=SLICES[agent]["budget"], client=c, em=em)
 
-    symptoms = triage(scoped["metrics"].db_id, em, client_=c)
+    # Triage always runs on the metrics table, even when MetricsAgent is not
+    # spawned (v2): the metrics SIGNAL is what symptoms[] is made of. When the
+    # agent is dropped, wave 0 loads metrics into the first DB purely to triage
+    # it, so the deterministic signal survives the agent's removal.
+    if "metrics" in scoped:
+        metrics_db = scoped["metrics"].db_id
+    else:
+        metrics_db = prov.db_ids[0]
+        load(metrics_db, "metrics", slice_path(scenario_id, "metrics", data_dir),
+             em, client_=c)
+    symptoms = triage(metrics_db, em, client_=c)
 
     em.event("wave_end", agent="pipeline", wave=0,
              duration_ms=(time.monotonic() - t0) * 1000, success=True,

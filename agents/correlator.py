@@ -48,7 +48,7 @@ def run_correlator(hsets: list[HypothesisSet], symptoms: list[dict], em: Emitter
         "agent_findings": [h.model_dump(mode="json") for h in hsets],
     }
     user = (
-        "Five source agents investigated this incident in parallel, each with access "
+        f"{len(hsets)} source agents investigated this incident in parallel, each with access "
         "to only one data source. Their findings and the wave-0 triage follow.\n\n"
         f"Onset ordering (computed, authoritative):\n{payload['onset_order']}\n\n"
         f"{json.dumps({'symptoms': symptoms, 'agent_findings': payload['agent_findings']}, indent=2, default=str)}\n\n"
@@ -59,6 +59,7 @@ def run_correlator(hsets: list[HypothesisSet], symptoms: list[dict], em: Emitter
                             messages=[{"role": "user", "content": user}],
                             schema=RCAReport, em=em, agent="correlator", wave=wave,
                             usage=usage, prompt_name="correlator")
+    validated = report is not None
     if report is None:
         report = _fallback_report(hsets, symptoms)
 
@@ -66,8 +67,8 @@ def run_correlator(hsets: list[HypothesisSet], symptoms: list[dict], em: Emitter
              duration_ms=(time.monotonic() - t0) * 1000,
              tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
              cost_usd=usage.cost_usd, retry_count=usage.retries,
-             prompt_hash=prompt_hash("correlator"), success=report is not None,
-             payload={"rca": report.model_dump(mode="json")})
+             prompt_hash=prompt_hash("correlator"), success=validated,
+             payload={"rca": report.model_dump(mode="json"), "fallback": not validated})
     return report, usage
 
 

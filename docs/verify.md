@@ -67,9 +67,8 @@ batch fills", plus a `job_id` to poll. Retrieve ids with
 `list_databases(batch=batch_id)`.
 
 `agents/hotdata_scope.provision()` polls at 250ms up to 60s, then resolves ids.
-Time-to-ready is unmeasured until credentials land — if it exceeds 10s, §13's
-mitigation applies: pre-warm a DB pool per batch and report provisioning
-separately in Q7.
+Earlier live checks recorded roughly 0.6–1.1 seconds for two databases.
+Re-measure for the current workspace and batch size before making latency claims.
 
 ## 5 — Teardown is NOT one call (correcting an earlier note)
 
@@ -103,18 +102,20 @@ text), `vector` (similarity). So FTS is `bm25`, not `fts`.
 `EmbeddingProvidersApi` with `provider_type` `"local"` or `"service"` — `"local"`
 should avoid needing a third-party embedding key, but this is untested.
 
-This is a live risk for HistoryAgent. `index()` skips the vector spec and emits
-an `error` row when no provider is configured, so a missing provider degrades
-HistoryAgent instead of breaking the run — and HistoryAgent plus the vector index
-is §12 cut-list item 1 anyway.
+This is a live risk for HistoryAgent. Parallel mode omits HistoryAgent when no provider is configured. The baseline
+still loads all five tables, and `index()` skips its vector index and emits an
+`error` event. This changes the available data and budget between the two arms;
+see the benchmark limitations in the README.
 
 Whether an index refreshes after a later load into the same table is still
 untested, and matters for FTS over telemetry `error_msg` in Q5.
 
 ## 7 — SQL dialect: all seven queries run
 
-**Q1-Q7 were executed against the live telemetry DB and all seven returned
-rows.** That includes the two that were in doubt: `PERCENTILE_CONT(...) WITHIN
+**The original Q1–Q7 were executed against the live telemetry DB and returned
+rows.** The current revisions separate failed runs, match baseline versions,
+and add Q8 for recent reports. They are checked offline with DuckDB; those
+changes still need a live Hotdata recheck. That includes the two that were in doubt: `PERCENTILE_CONT(...) WITHIN
 GROUP (ORDER BY ...)` in Q3 and `RANK() OVER (PARTITION BY ...)` in Q2. The
 `approx_percentile_cont` fallback is not needed.
 
@@ -133,9 +134,9 @@ through the databases/uploads APIs.
 | declare table | `add_database_table(db, schema, AddManagedTableRequest(name=...))` — columns inferred on load |
 | stage a file | `UploadsApi.upload_file(path)` → `upload_id` (handles multipart) |
 | load | `load_database_table(db, schema, table, LoadManagedTableRequest(upload_id=, format="parquet", mode=))` |
-| index | `IndexesApi.create_index(db, schema, table, CreateIndexRequest(index_type="bm25"|"vector"|"sorted"))` |
+| index | `IndexesApi.create_index(connection_id, schema, table, request)` using the connection ID returned by the load |
 | query | `QueryApi.query(QueryRequest(database_id=, sql=))` → `rows`, `columns`, `row_count`, `execution_time_ms` |
-| teardown | `delete_database_batch(batch_id)` |
+| teardown | `delete_database(id)` for each database, then `delete_database_batch(batch_id)` to cancel creation |
 | sweep | `list_databases(search=prefix)` → `delete_database(id)` |
 
 `QueryResponse.execution_time_ms` is the server-side duration — telemetry uses it
@@ -173,3 +174,12 @@ Three things this changed:
 Temperature 0 (plan §7.2) therefore holds only where the model accepts it. Both
 arms of the experiment use the same models and the same correlator prompt, so
 the parallel-vs-single control is unaffected either way.
+
+## Search query syntax remains unverified
+
+Creating an index does not verify the SQL used to search it. The templates in
+`agents/agent.py` currently use `search(...)` and `distance(...)`; verify them
+against the live service before claiming full-text or vector search works.
+`HOTDATA_FTS_SQL` and `HOTDATA_VECTOR_SQL` can override them. Logs and
+infrastructure agents can fall back to SQL; HistoryAgent currently has only
+the vector tool. The failure dashboard includes failed query events.

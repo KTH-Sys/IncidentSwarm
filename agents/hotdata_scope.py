@@ -6,10 +6,10 @@ Agents never receive truth.json and never see another agent's db_id or output
 before wave 2.
 
 VERIFY items resolved against hotdata SDK 0.10.0 — see docs/verify.md:
-  3. Row inserts ARE supported: load with mode="append" and inline `data`.
+  3. Telemetry appends use typed parquet uploads with mode="append".
   4. Bulk-create is ASYNC. Poll get_database_batch until created_count == count,
      then list_databases(batch=...) for the ids.
-  5. delete_database_batch(batch_id) tears down the whole batch in ONE call.
+  5. Delete each database individually, then cancel its creation batch.
   6. FTS index_type is "bm25"; vector needs an embedding_provider_id.
 """
 
@@ -69,7 +69,7 @@ class BudgetExceeded(RuntimeError):
 
 @dataclass
 class Provisioned:
-    """Wave-0 output. `batch_id` is the teardown handle — one call kills all five."""
+    """Wave-0 output: retain both the batch handle and individual database IDs."""
 
     batch_id: str
     db_ids: list[str]
@@ -88,7 +88,7 @@ class ScopedDB:
 
     def sql(self, statement: str) -> list[dict]:
         return query(self.db_id, statement, agent=self.agent, kind="sql",
-                     em=self.em, scope=self, client=self.client)
+                     em=self.em, scope=self, client_=self.client)
 
     @property
     def remaining(self) -> int:

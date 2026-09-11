@@ -49,11 +49,18 @@ def parse_seeds(tokens: list[str]) -> list[int]:
     """Accepts '1-12', '99', or a mix: --seeds 1-12 99"""
     seeds: list[int] = []
     for tok in tokens:
-        if "-" in tok:
-            lo, hi = tok.split("-", 1)
-            seeds.extend(range(int(lo), int(hi) + 1))
-        else:
-            seeds.append(int(tok))
+        try:
+            if "-" in tok:
+                lo, hi = map(int, tok.split("-", 1))
+                if lo < 0 or hi < lo:
+                    raise ValueError
+                seeds.extend(range(lo, hi + 1))
+            else:
+                seeds.append(int(tok))
+        except ValueError:
+            raise ValueError(f"Invalid seed {tok!r}; use a non-negative integer or range like 1-12") from None
+    if not seeds:
+        raise ValueError("Provide at least one seed")
     return sorted(dict.fromkeys(seeds))
 
 
@@ -190,13 +197,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Generate synthetic incident scenarios.")
     ap.add_argument("--seeds", nargs="+", required=True, help="e.g. 1-12 99")
     ap.add_argument("--out", type=Path, default=DATA_DIR)
-    ap.add_argument("--fault", help="force a fault type (used for the seed-99 demo)")
+    ap.add_argument("--fault", choices=tuple(CATALOG),
+                    help="force a fault type (used for the seed-99 demo)")
     ap.add_argument("--only-priority", action="store_true",
                     help="rotate over the 3 PRIORITY fault types only (§12 cut list)")
     args = ap.parse_args()
 
+    try:
+        seeds = parse_seeds(args.seeds)
+    except ValueError as exc:
+        ap.error(str(exc))
     keys = PRIORITY if args.only_priority else tuple(CATALOG)
-    for seed in parse_seeds(args.seeds):
+    for seed in seeds:
         ft = args.fault or fault_for_seed(seed, keys)
         sid = scenario_id(seed)
         out = args.out / sid
