@@ -1,1 +1,17 @@
+# Generated scenario data (regenerate with: python -m gen.scenarios --seeds 1-12 99)
+data/*
+!data/.gitkeep
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# macOS
 .DS_Store
