@@ -30,3 +30,8 @@ line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["bench"]
+
+[dependency-groups]
+dev = [
+    "duckdb>=1.5.5",
+]

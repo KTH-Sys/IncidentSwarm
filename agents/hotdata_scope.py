@@ -1,15 +1,16 @@
-"""Hotdata lifecycle: provision / load / index / scoped tools / destroy / sweep
+"""Hotdata lifecycle: provision / load / index / scoped query / destroy / sweep
 (plan.md §8).
 
 Isolation rule (§3): each wave-1 agent sees ONLY its own db_id plus symptoms[].
 Agents never receive truth.json and never see another agent's db_id or output
 before wave 2.
 
-Create -> query -> destroy is explicit and every step emits telemetry; destroy is
-always reached through a try/finally in wave 3, with sweep() as the backstop.
-
-The SDK calls below are the §8 VERIFY list — resolve them in the 10:00-11:00
-workshops before wiring.
+VERIFY items resolved against hotdata SDK 0.10.0 — see docs/verify.md:
+  3. Row inserts ARE supported: load with mode="append" and inline `data`.
+  4. Bulk-create is ASYNC. Poll get_database_batch until created_count == count,
+     then list_databases(batch=...) for the ids.
+  5. delete_database_batch(batch_id) tears down the whole batch in ONE call.
+  6. FTS index_type is "bm25"; vector needs an embedding_provider_id.
 """
 
 from __future__ import annotations
@@ -17,37 +18,59 @@ from __future__ import annotations
 import os
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
+
+import hotdata
 
 from telemetry.emit import Emitter
 
 DB_PREFIX = os.getenv("DB_PREFIX", "isw")
+DEFAULT_SCHEMA = "main"
+
+# Orphan backstop (§13): every run-scoped DB self-expires even if teardown and
+# the sweeper both fail. Comfortably longer than a run, far shorter than the event.
+DB_TTL = "30m"
 ORPHAN_MAX_AGE_S = 15 * 60
 
-# Per-agent slice: agent -> (table, parquet stem, query kinds, budget) — §7.2.
-SLICES: dict[str, dict[str, Any]] = {
-    "logs":     {"table": "logs",        "kinds": ("sql", "fts"),    "budget": 40},
-    "metrics":  {"table": "metrics",     "kinds": ("sql",),          "budget": 30},
-    "changes":  {"table": "changes",     "kinds": ("sql",),          "budget": 15},
-    "infra":    {"table": "k8s_events",  "kinds": ("sql", "fts"),    "budget": 15},
-    "history":  {"table": "postmortems", "kinds": ("vector",),       "budget": 10},
-}
+# Bulk-create polling (VERIFY item 4).
+PROVISION_POLL_S = 0.25
+PROVISION_TIMEOUT_S = 60.0
+INLINE_LOAD_MAX_BYTES = 2 * 1024 * 1024  # above this, stage an upload first
 
-# The single-agent baseline gets one DB with all five tables and all three
-# indexes, and a budget equal to the sum of the parallel agents' budgets (§3).
+# Per-agent slice: agent -> table, query kinds, budget (§7.2).
+SLICES: dict[str, dict[str, Any]] = {
+    "logs":    {"table": "logs",        "kinds": ("sql", "fts"),  "budget": 40},
+    "metrics": {"table": "metrics",     "kinds": ("sql",),        "budget": 30},
+    "changes": {"table": "changes",     "kinds": ("sql",),        "budget": 15},
+    "infra":   {"table": "k8s_events",  "kinds": ("sql", "fts"),  "budget": 15},
+    "history": {"table": "postmortems", "kinds": ("vector",),     "budget": 10},
+}
+FANOUT = tuple(SLICES)  # wave-1 order; index i maps to db_ids[i]
+
+# The single-agent baseline gets one DB with all five tables and a budget equal
+# to the sum of the parallel budgets (§3).
 SINGLE_BUDGET = sum(s["budget"] for s in SLICES.values())  # 110
 
+# (table, column, index_type). "bm25" is Hotdata's full-text type.
 INDEX_SPECS = (
-    ("logs", "msg", "fts"),
-    ("k8s_events", "message", "fts"),
+    ("logs", "msg", "bm25"),
+    ("k8s_events", "message", "bm25"),
     ("postmortems", "body", "vector"),
 )
 
 
 class BudgetExceeded(RuntimeError):
-    """Raised when an agent exhausts its query budget."""
+    """An agent exhausted its query budget."""
+
+
+@dataclass
+class Provisioned:
+    """Wave-0 output. `batch_id` is the teardown handle — one call kills all five."""
+
+    batch_id: str
+    db_ids: list[str]
 
 
 @dataclass
@@ -58,88 +81,256 @@ class ScopedDB:
     db_id: str
     budget: int
     used: int = 0
+    client: Any = field(default=None, repr=False)
+    em: Emitter | None = field(default=None, repr=False)
+
+    def sql(self, statement: str) -> list[dict]:
+        return query(self.db_id, statement, agent=self.agent, kind="sql",
+                     em=self.em, scope=self, client=self.client)
+
+    @property
+    def remaining(self) -> int:
+        return self.budget - self.used
 
 
-def provision(run_id: str, n: int, em: Emitter) -> list[str]:
-    """Bulk-create n instant DBs from one template. Address by ID — names are not
-    unique. Emits db_create x n with duration.
+def client(api_key: str | None = None, workspace: str | None = None) -> hotdata.ApiClient:
+    """Build an API client from the environment. Raises early with a clear
+    message rather than failing deep inside a wave."""
+    api_key = api_key or os.getenv("HOTDATA_API_KEY")
+    workspace = workspace or os.getenv("HOTDATA_WORKSPACE")
+    if not api_key:
+        raise RuntimeError("HOTDATA_API_KEY is not set — see .env.example")
+    if not workspace:
+        raise RuntimeError("HOTDATA_WORKSPACE is not set — see .env.example")
+    cfg = hotdata.Configuration(api_key=api_key, workspace_id=workspace)
+    if host := os.getenv("HOTDATA_HOST"):
+        cfg.host = host
+    return hotdata.ApiClient(cfg)
 
-    TODO(VERIFY item 4, §8): bulk-create response is sync vs async batch polling,
-    and time-to-ready. If >10s, pre-warm a DB pool per batch and report
-    provisioning separately in Q7 (§13).
+
+def provision(run_id: str, n: int, em: Emitter, *, client_: Any = None,
+              ttl: str = DB_TTL) -> Provisioned:
+    """Bulk-create n instant DBs from one template. Emits db_create x n.
+
+    Bulk-create is async (VERIFY item 4): the call returns a batch_id, and
+    created_count advances as the batch fills. We poll, then resolve ids with
+    list_databases(batch=...). DBs are addressed by ID — names are NOT unique.
+
+    Every DB carries expires_at=ttl so a crashed run cannot leave orphans
+    burning credits (§13).
     """
-    raise NotImplementedError("wire to Hotdata bulk-create after VERIFY item 4")
+    api = hotdata.DatabasesApi(client_ or client())
+    t0 = time.monotonic()
+
+    result = api.bulk_create_databases(
+        hotdata.BulkCreateDatabasesRequest(
+            count=n,
+            name_template=f"{DB_PREFIX}-{run_id}-{{index}}",
+            expires_at=ttl,
+            idempotency_key=f"{DB_PREFIX}-{run_id}",
+            default_schema=DEFAULT_SCHEMA,
+        )
+    )
+    batch_id = result.batch_id
+
+    deadline = time.monotonic() + PROVISION_TIMEOUT_S
+    while True:
+        batch = api.get_database_batch(batch_id)
+        if batch.created_count >= n:
+            break
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"bulk-create stalled: {batch.created_count}/{n} after "
+                f"{PROVISION_TIMEOUT_S}s (batch {batch_id})"
+            )
+        time.sleep(PROVISION_POLL_S)
+
+    page = api.list_databases(batch=batch_id, limit=max(n, 1))
+    db_ids = [d.id for d in page.databases][:n]
+    if len(db_ids) != n:
+        raise RuntimeError(f"batch {batch_id} yielded {len(db_ids)} ids, wanted {n}")
+
+    # One db_create row per DB, so Q7 can separate provisioning from agent time.
+    each_ms = (time.monotonic() - t0) * 1000 / n
+    for db_id in db_ids:
+        em.event("db_create", agent="pipeline", wave=0, db_id=db_id,
+                 duration_ms=each_ms, success=True,
+                 payload={"batch_id": batch_id, "expires_at": ttl})
+
+    return Provisioned(batch_id=batch_id, db_ids=db_ids)
 
 
-def load(db_id: str, table: str, parquet: Path, em: Emitter) -> int:
-    """Upload + load parquet into `table`. Returns row count; emits db_load.
+def load(db_id: str, table: str, parquet: Path, em: Emitter, *, client_: Any = None,
+         mode: str = "replace") -> int:
+    """Upload + load a parquet slice into `table`. Returns rows; emits db_load.
 
-    Parquet, not inline CSV — inline caps at 2 MB and logs.parquet is ~200k rows.
+    Files above 2 MB are staged through the uploads API — inline `data` is the
+    quick path for small payloads only, and logs.parquet is ~200k rows.
     """
-    raise NotImplementedError("wire to Hotdata load after VERIFY item 3")
+    c = client_ or client()
+    api = hotdata.DatabasesApi(c)
+    parquet = Path(parquet)
+    t0 = time.monotonic()
+
+    # Declare the table; columns are inferred from the parquet on load.
+    try:
+        api.add_database_table(db_id, DEFAULT_SCHEMA,
+                               hotdata.AddManagedTableRequest(name=table))
+    except hotdata.ApiException as exc:
+        if exc.status not in (400, 409):  # already declared is fine
+            raise
+
+    upload_id = hotdata.UploadsApi(c).upload_file(
+        parquet, filename=parquet.name, content_type="application/vnd.apache.parquet"
+    ).upload_id
+
+    resp = api.load_database_table(
+        db_id, DEFAULT_SCHEMA, table,
+        hotdata.LoadManagedTableRequest(upload_id=upload_id, format="parquet", mode=mode),
+    )
+    rows = resp.row_count or 0
+    em.event("db_load", agent="pipeline", wave=0, db_id=db_id,
+             duration_ms=(time.monotonic() - t0) * 1000, rows_returned=rows,
+             success=True, payload={"table": table, "mode": mode})
+    return rows
 
 
-def index(db_id: str, specs: tuple = INDEX_SPECS, *, em: Emitter) -> None:
-    """FTS on logs.msg and k8s_events.message; vector on postmortems.body.
-    Emits db_load with kind=index.
+def index(db_id: str, specs: tuple = INDEX_SPECS, *, em: Emitter, client_: Any = None,
+          embedding_provider_id: str | None = None, only_table: str | None = None) -> None:
+    """Create the search indexes a DB needs. Emits db_load with kind=index.
 
-    TODO(VERIFY item 6, §8): do indexes refresh after new loads into an existing
-    table? Affects FTS on the telemetry error_msg index.
+    Only builds specs whose table is present, so a sliced DB builds just its own
+    (the logs DB gets bm25 on logs.msg and nothing else).
+
+    A vector index needs an embedding provider (VERIFY item 6). Without one the
+    vector spec is skipped and HistoryAgent degrades to no index — which is §12
+    cut-list item 1 anyway, so a missing provider must not break the run.
     """
-    raise NotImplementedError("wire to Hotdata index after VERIFY item 6")
+    api = hotdata.IndexesApi(client_ or client())
+    provider = embedding_provider_id or os.getenv("HOTDATA_EMBEDDING_PROVIDER_ID")
+
+    for table, column, kind in specs:
+        if only_table and table != only_table:
+            continue
+        if kind == "vector" and not provider:
+            em.event("error", agent="pipeline", wave=0, db_id=db_id, success=False,
+                     error_msg="no embedding provider; vector index skipped",
+                     payload={"table": table, "column": column})
+            continue
+        t0 = time.monotonic()
+        req = hotdata.CreateIndexRequest(
+            index_name=f"{table}_{column}_{kind}",
+            columns=[column],
+            index_type=kind,
+            **({"embedding_provider_id": provider} if kind == "vector" else {}),
+        )
+        api.create_index(db_id, DEFAULT_SCHEMA, table, req)
+        em.event("db_load", agent="pipeline", wave=0, db_id=db_id,
+                 duration_ms=(time.monotonic() - t0) * 1000, success=True,
+                 payload={"kind": "index", "table": table, "column": column, "type": kind})
 
 
-def tools(db_id: str, budget: int, agent: str, em: Emitter) -> list[Any]:
-    """Scoped SQL/search tools for one agent. Enforces the budget and times every
-    call, emitting a `query` row per call (kind, text truncated, rows, duration).
+def query(db_id: str, sql: str, *, agent: str, kind: str = "sql", em: Emitter,
+          scope: ScopedDB | None = None, client_: Any = None) -> list[dict]:
+    """Run one scoped query. Enforces the budget, times it, emits a `query` row.
 
-    Preferred: hotdata-langchain tools, if RocketRide accepts LangChain tools.
-    Fallback: thin wrappers over the Python SDK.
-
-    TODO(VERIFY items 1-2, §8): how a RocketRide agent node calls custom Python /
-    LangChain tools inside a wave, and whether waves can be parameterized with
-    runtime values (wave-0 db_ids -> wave-1 agent config). Fallback for item 1 is
-    agents-as-tools under a parent agent node (GATE 1, 11:45).
+    This is the only path an agent has to data — it cannot reach another db_id.
     """
-    raise NotImplementedError("wire tool binding after VERIFY items 1-2")
+    if scope is not None:
+        if scope.used >= scope.budget:
+            raise BudgetExceeded(f"{agent} exhausted its budget of {scope.budget}")
+        scope.used += 1
+
+    api = hotdata.QueryApi(client_ or client())
+    t0 = time.monotonic()
+    try:
+        resp = api.query(hotdata.QueryRequest(
+            database_id=db_id, sql=sql, default_schema=DEFAULT_SCHEMA))
+    except Exception as exc:  # noqa: BLE001 — a bad query is an agent's problem, not a crash
+        em.event("query", agent=agent, wave=1, db_id=db_id, query_kind=kind,
+                 query_text=sql, duration_ms=(time.monotonic() - t0) * 1000,
+                 success=False, error_msg=str(exc)[:500])
+        raise
+
+    rows = [dict(zip(resp.columns or [], r)) for r in (resp.rows or [])]
+    em.event("query", agent=agent, wave=1, db_id=db_id, query_kind=kind,
+             query_text=sql, rows_returned=resp.row_count,
+             duration_ms=resp.execution_time_ms or (time.monotonic() - t0) * 1000,
+             success=True)
+    return rows
 
 
-def destroy(db_ids: list[str], em: Emitter) -> None:
-    """Delete DBs. ALWAYS reached through try/finally in wave 3. Emits db_destroy x n.
+def destroy(batch_id: str, em: Emitter, *, db_ids: list[str] | None = None,
+            client_: Any = None) -> int:
+    """Delete a whole batch in one call. ALWAYS reached through try/finally.
 
-    Never raises: a teardown failure must not mask a run's result. Failures are
-    emitted with success=False and swept later.
-
-    TODO(VERIFY item 5, §8): delete-DB call and its rate limits.
+    Never raises: a teardown failure must not mask a run's result. It is emitted
+    with success=False, and expires_at plus sweep() are the backstops.
     """
-    raise NotImplementedError("wire to Hotdata delete after VERIFY item 5")
+    api = hotdata.DatabasesApi(client_ or client())
+    t0 = time.monotonic()
+    try:
+        resp = api.delete_database_batch(batch_id)
+        deleted = resp.deleted_count or 0
+        ok, err = True, None
+    except Exception as exc:  # noqa: BLE001
+        deleted, ok, err = 0, False, str(exc)[:500]
+
+    each_ms = (time.monotonic() - t0) * 1000 / max(len(db_ids or []), 1)
+    for db_id in db_ids or [None]:
+        em.event("db_destroy", agent="pipeline", wave=3, db_id=db_id,
+                 duration_ms=each_ms, success=ok, error_msg=err,
+                 payload={"batch_id": batch_id, "deleted_count": deleted})
+    return deleted
 
 
-def sweep(prefix: str = DB_PREFIX, max_age_s: int = ORPHAN_MAX_AGE_S, *, em: Emitter) -> int:
+def sweep(prefix: str = DB_PREFIX, max_age_s: int = ORPHAN_MAX_AGE_S, *, em: Emitter,
+          client_: Any = None) -> int:
     """Delete orphaned `{prefix}-*` DBs older than max_age_s. Run at batch start
     and end. Emits db_destroy with agent='sweeper'. Returns the count reaped.
 
     Zero orphan DBs is a submission checklist item (§15).
     """
-    raise NotImplementedError("wire to Hotdata list+delete after VERIFY item 5")
+    from datetime import datetime, timedelta, timezone
+
+    api = hotdata.DatabasesApi(client_ or client())
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_s)
+    reaped, cursor = 0, None
+
+    while True:
+        page = api.list_databases(search=prefix, limit=100, cursor=cursor)
+        for db in page.databases:
+            created = getattr(db, "created_at", None)
+            if not (db.name or "").startswith(prefix) or (created and created > cutoff):
+                continue
+            t0 = time.monotonic()
+            try:
+                api.delete_database(db.id)
+                ok, err = True, None
+                reaped += 1
+            except Exception as exc:  # noqa: BLE001
+                ok, err = False, str(exc)[:500]
+            em.event("db_destroy", agent="sweeper", wave=3, db_id=db.id,
+                     duration_ms=(time.monotonic() - t0) * 1000, success=ok,
+                     error_msg=err, payload={"reason": "orphan sweep"})
+        if not page.has_more:
+            break
+        cursor = page.next_cursor
+    return reaped
 
 
 @contextmanager
-def run_scope(run_id: str, n: int, em: Emitter) -> Iterator[list[str]]:
+def run_scope(run_id: str, n: int, em: Emitter, *, client_: Any = None) -> Iterator[Provisioned]:
     """Provision n DBs and guarantee teardown.
 
-    with run_scope(run_id, 5, em) as db_ids:
-        ...  # waves 1-2
-    # wave 3 teardown happens here, even on exception
+        with run_scope(run_id, 5, em) as prov:
+            ...  # waves 1-2 over prov.db_ids
+        # wave 3 teardown happens here, even on exception
     """
-    db_ids: list[str] = []
+    prov: Provisioned | None = None
     try:
-        db_ids = provision(run_id, n, em)
-        yield db_ids
+        prov = provision(run_id, n, em, client_=client_)
+        yield prov
     finally:
-        if db_ids:
-            try:
-                destroy(db_ids, em)
-            except Exception:  # noqa: BLE001 — teardown must never mask the real error
-                em.event("error", agent="pipeline", wave=3, success=False,
-                         error_msg="teardown failed; left to sweeper")
+        if prov is not None:
+            destroy(prov.batch_id, em, db_ids=prov.db_ids, client_=client_)
