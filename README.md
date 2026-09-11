@@ -87,29 +87,40 @@ the effect can be attributed.
 ```
 gen/          synthetic incident generator — faults, noise, cascade, postmortems
 data/         generated scenarios: 5 parquet tables + truth.json each (gitignored)
-pipes/        RocketRide pipelines, exported from Cloud
-agents/       pydantic contracts, Hotdata lifecycle, and the 7 prompts
+pipes/        SPEC.md — the wave graph; .pipe files exported from RocketRide Cloud
+agents/       schemas, Hotdata lifecycle, the 7 prompts, and waves 0-3
+  wave0.py      provision + load + index + deterministic triage SQL
+  agent.py      one wave-1 source agent: tool loop, budget enforcement, telemetry
+  correlator.py wave 2 fan-in
+  baseline.py   the single-agent control arm
+  pipeline.py   waves 0-3 end to end, both modes, teardown guaranteed
 telemetry/    frozen event schema, buffered emitter, Q1–Q7
-bench/        scorer and batch runner
+bench/        preflight, validity check, scorer, batch runner
 dashboard/    Streamlit — runs Q1–Q7 live on page load
 ```
 
-`plan.md` is the full build plan: thesis, data model, fault catalog, scoring,
-telemetry schema, benchmark protocol, and timeline.
+`plan.md` is the full build plan. `docs/verify.md` records which sponsor-API
+questions were resolved, how, and what changed as a result.
 
 ## Run it
 
 ```bash
 uv sync
-cp .env.example .env          # fill in keys; set TELEMETRY_DB_ID after creating the telemetry DB
+cp .env.example .env          # HOTDATA_API_KEY, HOTDATA_WORKSPACE, ANTHROPIC_API_KEY
+
+# one-time: create the event-scoped telemetry DB, then put the id in .env
+uv run python -m bench.preflight --create-telemetry-db
+
+# prove the stack works: create -> load -> query -> destroy, for real
+uv run python -m bench.preflight
 
 # generate scenarios (seeds 1-12 batch set, 99 demo hold-out)
 uv run python -m gen.scenarios --seeds 1-12 99
 
-# check the scorer: a perfect RCAReport scores 4, an empty one scores 0
-uv run python -m bench.score
+# prove every scenario is actually solvable from its own data
+uv run python -m bench.validate
 
-# benchmark: interleave parallel and single so both meet the same rate limits
+# benchmark: interleaves parallel and single so both meet the same rate limits
 uv run python -m bench.run_batch --mode both --version v1 --seeds 1-12 --concurrency 3
 
 # live telemetry
@@ -130,3 +141,17 @@ its error elevation, lagged 1–2 minutes — plus two red herrings sampled from
 unrelated deploys, flag flips, gateway spikes, and routine rollout noise. An agent
 that blames the loudest service blames `gateway` and scores 0. Getting it right
 means ordering onsets, not ranking magnitudes.
+
+## Is the benchmark fair?
+
+A score only means something if the answer was reachable. `bench/validate.py`
+runs the **real** wave-0 triage SQL against the generated parquet with DuckDB and
+checks, for all 13 scenarios, that the true root service is the earliest
+sustained onset, that the cascade never overtakes the service it follows, that
+the trigger event exists, and that the root's log signature is present after t0.
+
+It has already earned its place. The first cascade implementation lit up
+`gateway` before `checkout`, even though gateway sits upstream of it; and the
+first triage reported a resolved red-herring spike as the earliest onset in 3 of
+13 scenarios, which would have fed every agent a misleading `symptoms[]` and made
+those runs unwinnable. Both were caught here, not in review.

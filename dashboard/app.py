@@ -13,10 +13,15 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import config  # noqa: E402,F401  — loads .env
 
 QUERIES_PATH = Path(__file__).resolve().parent.parent / "telemetry" / "queries.sql"
 
@@ -33,13 +38,20 @@ def load_queries(path: Path = QUERIES_PATH) -> dict[str, str]:
 def run_query(sql: str) -> pd.DataFrame:
     """Execute against the persistent telemetry DB.
 
-    TODO: wire to the Hotdata SDK using TELEMETRY_DB_ID. No caching — every
-    query must run on page load (§2, "queries run live in the demo").
+    Deliberately uncached: the judges are told these numbers are live, so every
+    query runs on page load (§2). If this ever gets an @st.cache_data, the claim
+    stops being true.
     """
+    import hotdata
+
+    from agents.hotdata_scope import client
+
     db_id = os.getenv("TELEMETRY_DB_ID")
     if not db_id:
         raise RuntimeError("TELEMETRY_DB_ID is not set — see .env.example")
-    raise NotImplementedError("wire to the Hotdata SDK")
+    resp = hotdata.QueryApi(client()).query(
+        hotdata.QueryRequest(database_id=db_id, sql=sql, default_schema="main"))
+    return pd.DataFrame(resp.rows or [], columns=list(resp.columns or []))
 
 
 def show(name: str, caption: str, q: dict[str, str], *, kind: str = "table") -> None:

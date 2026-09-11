@@ -25,6 +25,7 @@ import json
 import sys
 from pathlib import Path
 
+import config  # noqa: F401  — loads .env
 import duckdb
 import pandas as pd
 

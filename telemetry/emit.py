@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -65,18 +66,59 @@ class Sink(Protocol):
 
 
 class HotdataSink:
-    """Loads micro-batches into the persistent telemetry DB.
+    """Appends micro-batches into the persistent telemetry DB.
 
-    TODO(VERIFY item 3, §8): if row inserts are supported, INSERT directly here.
-    Otherwise write the batch as parquet and `db_load` it into `events`.
+    VERIFY item 3 is resolved: row inserts ARE supported — a managed-table load
+    with mode="append" and inline `data`. So telemetry appends directly and does
+    not need the load-only parquet workaround.
+
+    The telemetry DB is event-scoped: created once at schema-freeze time, never
+    torn down, and shared across every run of the event (§9.1).
     """
 
-    def __init__(self, db_id: str, table: str = TABLE) -> None:
-        self.db_id = db_id
+    def __init__(self, db_id: str | None = None, table: str = TABLE,
+                 schema: str = "main", client: Any = None) -> None:
+        self.db_id = db_id or os.getenv("TELEMETRY_DB_ID")
+        if not self.db_id:
+            raise RuntimeError("TELEMETRY_DB_ID is not set — see .env.example")
         self.table = table
+        self.schema = schema
+        self._client = client
+
+    def _api(self):
+        import hotdata
+
+        from agents.hotdata_scope import client as make_client
+        return hotdata.DatabasesApi(self._client or make_client())
 
     def write(self, batch: list[dict[str, Any]]) -> None:
-        raise NotImplementedError("wire to the Hotdata SDK after VERIFY item 3")
+        import hotdata
+
+        ndjson = "\n".join(json.dumps(_jsonable(row), default=str) for row in batch)
+        self._api().load_database_table(
+            self.db_id, self.schema, self.table,
+            hotdata.LoadManagedTableRequest(data=ndjson, format="json", mode="append"),
+        )
+
+    def create_table(self) -> None:
+        """Run once, at schema-freeze time (§11, 10:00-11:00)."""
+        import hotdata
+
+        from agents.hotdata_scope import client as make_client
+        from telemetry.schema import create_table_sql
+
+        api = hotdata.QueryApi(self._client or make_client())
+        api.query(hotdata.QueryRequest(database_id=self.db_id,
+                                       sql=create_table_sql(self.table),
+                                       default_schema=self.schema))
+
+
+def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
+    """Timestamps to ISO strings; everything else passes through."""
+    out = {}
+    for k, v in row.items():
+        out[k] = v.isoformat() if isinstance(v, datetime) else v
+    return out
 
 
 class ParquetSink:

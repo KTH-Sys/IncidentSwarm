@@ -23,6 +23,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+import config  # noqa: F401  — loads .env
+
 from gen import noise
 from gen.faults import CATALOG, PRIORITY, T0_RANGE_MIN, WINDOW_MIN
 from gen.postmortems import build_corpus
