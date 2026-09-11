@@ -35,10 +35,16 @@ from telemetry.schema import ARROW_SCHEMA, QUERY_TEXT_MAX, TABLE, blank_row
 
 log = logging.getLogger(__name__)
 
+# Serializes appends to the shared telemetry table across threads in this
+# process. Cross-process contention (several runners at once) is handled by the
+# retry/backoff in Emitter.flush.
+_WRITE_LOCK = threading.Lock()
+LOCKED_BACKOFF_S = 1.5
+
 BACKLOG_DIR = Path("data/telemetry_backlog")
 FLUSH_EVERY_N = 50
 FLUSH_EVERY_S = 2.0
-FLUSH_RETRIES = 3
+FLUSH_RETRIES = 4
 
 
 @dataclass
@@ -103,6 +109,17 @@ class HotdataSink:
         return self._client
 
     def write(self, batch: list[dict[str, Any]]) -> None:
+        import hotdata
+
+        # One load at a time per process. Every run and every agent appends to
+        # the SAME events table, and Hotdata rejects concurrent loads on one
+        # table with 409 RESOURCE_LOCKED. Serializing here costs nothing (the
+        # batches are small) and removes the contention that was pushing rows
+        # into the backlog during a 3-way concurrent batch.
+        with _WRITE_LOCK:
+            return self._write_locked(batch)
+
+    def _write_locked(self, batch: list[dict[str, Any]]) -> None:
         import hotdata
 
         c = self._c()
@@ -192,8 +209,12 @@ class Emitter:
                 self._last_flush = time.monotonic()
                 return True
             except Exception as exc:  # noqa: BLE001 — telemetry must never break a run
-                log.warning("telemetry flush failed (attempt %d): %s", attempt + 1, exc)
-                time.sleep(0.2 * (attempt + 1))
+                locked = "RESOURCE_LOCKED" in str(exc)
+                log.warning("telemetry flush failed (attempt %d)%s: %s",
+                            attempt + 1, " [locked]" if locked else "", str(exc)[:200])
+                # A locked table clears on its own; back off properly rather than
+                # spending the retries in under a second and spilling to backlog.
+                time.sleep((LOCKED_BACKOFF_S if locked else 0.2) * (attempt + 1))
 
         self.dropped += len(batch)
         try:

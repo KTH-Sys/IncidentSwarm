@@ -165,9 +165,23 @@ def provision(run_id: str, n: int, em: Emitter, *, client_: Any = None,
     return Provisioned(batch_id=batch_id, db_ids=db_ids)
 
 
+@dataclass
+class Loaded:
+    """A load's result.
+
+    `connection_id` is needed to index the table: the indexes API is addressed by
+    CONNECTION id, not database id, and the two are different strings (`conn...`
+    vs `dbid...`). Passing the database id fails with a misleading
+    "Table 'main.logs' not found in connection 'dbid...'" 404.
+    """
+
+    rows: int
+    connection_id: str | None
+
+
 def load(db_id: str, table: str, parquet: Path, em: Emitter, *, client_: Any = None,
-         mode: str = "replace") -> int:
-    """Upload + load a parquet slice into `table`. Returns rows; emits db_load.
+         mode: str = "replace") -> Loaded:
+    """Upload + load a parquet slice into `table`. Emits db_load.
 
     Files above 2 MB are staged through the uploads API — inline `data` is the
     quick path for small payloads only, and logs.parquet is ~200k rows.
@@ -196,13 +210,17 @@ def load(db_id: str, table: str, parquet: Path, em: Emitter, *, client_: Any = N
     rows = resp.row_count or 0
     em.event("db_load", agent="pipeline", wave=0, db_id=db_id,
              duration_ms=(time.monotonic() - t0) * 1000, rows_returned=rows,
-             success=True, payload={"table": table, "mode": mode})
-    return rows
+             success=True, payload={"table": table, "mode": mode,
+                                    "connection_id": resp.connection_id})
+    return Loaded(rows=rows, connection_id=resp.connection_id)
 
 
-def index(db_id: str, specs: tuple = INDEX_SPECS, *, em: Emitter, client_: Any = None,
-          embedding_provider_id: str | None = None, only_table: str | None = None) -> None:
-    """Create the search indexes a DB needs. Emits db_load with kind=index.
+def index(connection_id: str | None, specs: tuple = INDEX_SPECS, *, em: Emitter,
+          client_: Any = None, embedding_provider_id: str | None = None,
+          only_table: str | None = None, db_id: str | None = None) -> None:
+    """Create the search indexes a table needs. Emits db_load with kind=index.
+
+    Addressed by CONNECTION id (from a Loaded result), not database id.
 
     Only builds specs whose table is present, so a sliced DB builds just its own
     (the logs DB gets bm25 on logs.msg and nothing else).
@@ -211,6 +229,11 @@ def index(db_id: str, specs: tuple = INDEX_SPECS, *, em: Emitter, client_: Any =
     vector spec is skipped and HistoryAgent degrades to no index — which is §12
     cut-list item 1 anyway, so a missing provider must not break the run.
     """
+    if not connection_id:
+        em.event("error", agent="pipeline", wave=0, db_id=db_id, success=False,
+                 error_msg="no connection_id; indexes skipped")
+        return
+
     api = hotdata.IndexesApi(client_ or client())
     provider = embedding_provider_id or os.getenv("HOTDATA_EMBEDDING_PROVIDER_ID")
 
@@ -229,7 +252,7 @@ def index(db_id: str, specs: tuple = INDEX_SPECS, *, em: Emitter, client_: Any =
             index_type=kind,
             **({"embedding_provider_id": provider} if kind == "vector" else {}),
         )
-        api.create_index(db_id, DEFAULT_SCHEMA, table, req)
+        api.create_index(connection_id, DEFAULT_SCHEMA, table, req)
         em.event("db_load", agent="pipeline", wave=0, db_id=db_id,
                  duration_ms=(time.monotonic() - t0) * 1000, success=True,
                  payload={"kind": "index", "table": table, "column": column, "type": kind})
@@ -320,6 +343,7 @@ def sweep(prefix: str = DB_PREFIX, max_age_s: int = ORPHAN_MAX_AGE_S, *, em: Emi
 
     api = hotdata.DatabasesApi(client_ or client())
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_s)
+    telemetry_db = os.getenv("TELEMETRY_DB_ID")
     reaped, cursor = 0, None
 
     while True:
@@ -327,6 +351,17 @@ def sweep(prefix: str = DB_PREFIX, max_age_s: int = ORPHAN_MAX_AGE_S, *, em: Emi
         for db in page.databases:
             created = getattr(db, "created_at", None)
             if not (db.name or "").startswith(prefix) or (created and created > cutoff):
+                continue
+            # NEVER sweep the telemetry DB. It shares the isw- prefix, is older
+            # than any cutoff, and holds the entire event's results — deleting it
+            # is unrecoverable. Three independent guards, because one bad sweep
+            # ends the day: its id, its name, and the fact that run-scoped DBs
+            # always carry expires_at while the telemetry DB never does.
+            if db.id == telemetry_db:
+                continue
+            if (db.name or "").startswith(f"{prefix}-telemetry"):
+                continue
+            if getattr(db, "expires_at", None) is None:
                 continue
             t0 = time.monotonic()
             try:

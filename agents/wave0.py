@@ -155,7 +155,8 @@ def slice_path(scenario_id: str, agent: str, data_dir: Path) -> Path:
 
 
 def run_wave0(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Path("data"),
-              client_: Any = None, n: int = len(FANOUT)) -> Wave0Result:
+              client_: Any = None, n: int = len(FANOUT),
+              state: dict | None = None) -> Wave0Result:
     """Provision, load slices, index, triage. Returns db_ids + symptoms[].
 
     Caller owns teardown — wrap this in hotdata_scope.run_scope, or call
@@ -166,14 +167,19 @@ def run_wave0(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Pa
     em.event("wave_start", agent="pipeline", wave=0)
 
     prov = provision(run_id, n, em, client_=c)
+    # Register the moment the DBs exist, so a failure in load or index still
+    # reaches teardown. Anything set after this point is too late.
+    if state is not None:
+        state["prov"] = prov
 
     # Each DB gets exactly one slice. FANOUT order maps agent -> db_ids[i].
     scoped: dict[str, ScopedDB] = {}
     for i, agent in enumerate(FANOUT[:n]):
         db_id = prov.db_ids[i]
         table = SLICES[agent]["table"]
-        load(db_id, table, slice_path(scenario_id, agent, data_dir), em, client_=c)
-        index(db_id, INDEX_SPECS, em=em, client_=c, only_table=table)
+        loaded = load(db_id, table, slice_path(scenario_id, agent, data_dir), em, client_=c)
+        index(loaded.connection_id, INDEX_SPECS, em=em, client_=c, only_table=table,
+              db_id=db_id)
         scoped[agent] = ScopedDB(agent=agent, db_id=db_id,
                                  budget=SLICES[agent]["budget"], client=c, em=em)
 

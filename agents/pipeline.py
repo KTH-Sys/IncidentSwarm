@@ -36,7 +36,7 @@ from agents.hotdata_scope import (
     load,
     provision,
 )
-from agents.llm import Usage
+from agents.llm import STRONG_MODEL, Usage, prompt_hash, warm
 from agents.schemas import HypothesisSet, RCAReport
 from agents.wave0 import Wave0Result, run_wave0, slice_path, triage
 from bench.score import load_truth, score_agent, score_report
@@ -66,12 +66,22 @@ def _history_enabled() -> bool:
 
 
 def run_parallel(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Path("data"),
-                 client_: Any = None) -> tuple[RCAReport, dict]:
-    """Waves 0-2 for the parallel arm. Teardown is the caller's finally path."""
+                 client_: Any = None, state: dict | None = None) -> tuple[RCAReport, dict]:
+    """Waves 0-2 for the parallel arm. Teardown is the caller's finally path,
+    driven by `state["prov"]`, which wave 0 sets as soon as the DBs exist."""
     c = client_ or client()
+    state = state if state is not None else {}
     agents = [a for a in FANOUT if a != "history" or _history_enabled()]
 
-    w0 = run_wave0(run_id, scenario_id, em, data_dir=data_dir, client_=c, n=len(agents))
+    # Learn each model's parameter quirks once, before five agents discover the
+    # same 400 concurrently.
+    from agents.llm import FAST_MODEL
+    warm(FAST_MODEL, em)
+    warm(STRONG_MODEL, em)
+
+    w0 = run_wave0(run_id, scenario_id, em, data_dir=data_dir, client_=c, n=len(agents),
+                   state=state)
+    state["w0"] = w0
     symptoms = [s.as_agent_context() for s in w0.symptoms]
 
     # WAVE 1 — fan-out. This ThreadPoolExecutor is the claim being tested.
@@ -79,16 +89,20 @@ def run_parallel(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path =
     em.event("wave_start", agent="pipeline", wave=1)
     hsets: dict[str, HypothesisSet] = {}
     usages: list[Usage] = []
+    outcomes: dict[str, Any] = {}
     with ThreadPoolExecutor(max_workers=len(agents)) as pool:
         futures = {pool.submit(run_agent, a, w0.scoped[a], symptoms, em): a for a in agents}
         for fut in as_completed(futures):
             a = futures[fut]
             try:
-                hset, usage = fut.result()
+                outcome = fut.result()
+                hsets[a], outcomes[a] = outcome.hset, outcome
+                usages.append(outcome.usage)
             except Exception as exc:  # noqa: BLE001 — one agent must not kill the run
                 em.event("error", agent=a, wave=1, success=False, error_msg=str(exc)[:500])
-                hset, usage = HypothesisSet.empty(a), Usage()
-            hsets[a], _ = hset, usages.append(usage)
+                hsets[a] = HypothesisSet.empty(a)
+                usages.append(Usage())
+    state["outcomes"] = outcomes
     em.event("wave_end", agent="pipeline", wave=1,
              duration_ms=(time.monotonic() - t1) * 1000, success=True)
 
@@ -100,22 +114,27 @@ def run_parallel(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path =
              duration_ms=(time.monotonic() - t2) * 1000, success=True)
 
     usages.append(corr_usage)
-    return report, {"w0": w0, "hsets": hsets, "usages": usages, "symptoms": symptoms}
+    state.update(hsets=hsets, usages=usages, symptoms=symptoms)
+    return report, state
 
 
 def run_single(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = Path("data"),
-               client_: Any = None) -> tuple[RCAReport, dict]:
+               client_: Any = None, state: dict | None = None) -> tuple[RCAReport, dict]:
     """The baseline arm: one DB, all five tables, all three indexes, budget 110."""
     c = client_ or client()
+    state = state if state is not None else {}
     t0 = time.monotonic()
     em.event("wave_start", agent="pipeline", wave=0)
 
     prov = provision(run_id, 1, em, client_=c)
+    state["prov"] = prov  # register before anything that can fail
     db_id = prov.db_ids[0]
+    connection_id = None
     for agent in FANOUT:
-        load(db_id, SLICES[agent]["table"], slice_path(scenario_id, agent, data_dir),
-             em, client_=c)
-    index(db_id, INDEX_SPECS, em=em, client_=c)
+        loaded = load(db_id, SLICES[agent]["table"],
+                      slice_path(scenario_id, agent, data_dir), em, client_=c)
+        connection_id = connection_id or loaded.connection_id
+    index(connection_id, INDEX_SPECS, em=em, client_=c, db_id=db_id)
 
     symptoms_objs = triage(db_id, em, client_=c)
     symptoms = [s.as_agent_context() for s in symptoms_objs]
@@ -125,7 +144,8 @@ def run_single(run_id: str, scenario_id: str, em: Emitter, *, data_dir: Path = P
 
     scope = ScopedDB(agent="single", db_id=db_id, budget=SINGLE_BUDGET, client=c, em=em)
     report, usage = run_baseline(scope, symptoms, em)
-    return report, {"prov": prov, "scope": scope, "usages": [usage], "symptoms": symptoms}
+    state.update(scope=scope, usages=[usage], symptoms=symptoms)
+    return report, state
 
 
 def run_once(scenario_id: str, mode: str, pipeline_version: str, *,
@@ -145,21 +165,21 @@ def run_once(scenario_id: str, mode: str, pipeline_version: str, *,
 
     t0 = time.monotonic()
     em.event("run_start", agent="pipeline", wave=0)
+    # `state` is populated as the run proceeds, NOT returned at the end, so the
+    # finally path can tear down databases even when the step that failed came
+    # after provisioning. Binding teardown to the return value meant a failure
+    # anywhere in waves 0-2 leaked every DB the run had created.
     state: dict = {}
-    batch_id = None
-    db_ids: list[str] = []
     try:
-        if mode == "parallel":
-            report, state = run_parallel(run_id, scenario_id, em, data_dir=data_dir, client_=c)
-            batch_id, db_ids = state["w0"].prov.batch_id, state["w0"].db_ids
-        else:
-            report, state = run_single(run_id, scenario_id, em, data_dir=data_dir, client_=c)
-            batch_id, db_ids = state["prov"].batch_id, state["prov"].db_ids
+        runner = run_parallel if mode == "parallel" else run_single
+        report, state = runner(run_id, scenario_id, em, data_dir=data_dir,
+                               client_=c, state=state)
     finally:
         # WAVE 3 — teardown, always.
-        if batch_id:
+        prov = state.get("prov")
+        if prov is not None:
             em.event("wave_start", agent="pipeline", wave=3)
-            destroy(batch_id, em, db_ids=db_ids, client_=c)
+            destroy(prov.batch_id, em, db_ids=prov.db_ids, client_=c)
 
     scored = score_report(report, truth)
     usages = state.get("usages", [])
@@ -167,12 +187,19 @@ def run_once(scenario_id: str, mode: str, pipeline_version: str, *,
     tin = sum(u.tokens_in for u in usages)
     tout = sum(u.tokens_out for u in usages)
 
-    # Per-agent hits are stamped after the fact, outside agent context.
-    for agent, hset in state.get("hsets", {}).items():
-        hits = score_agent(hset, truth)
-        em.event("agent_end", agent=agent, wave=1, success=True,
+    # ONE agent_end per agent (§9.1), emitted here because hit_service and
+    # hit_fault derive from truth and must be computed outside agent context.
+    for agent, outcome in state.get("outcomes", {}).items():
+        hits = score_agent(outcome.hset, truth)
+        em.event("agent_end", agent=agent, wave=1, db_id=outcome.db_id,
+                 model=outcome.model, duration_ms=outcome.duration_ms,
+                 query_count=outcome.queries, tokens_in=outcome.usage.tokens_in,
+                 tokens_out=outcome.usage.tokens_out, cost_usd=outcome.usage.cost_usd,
+                 retry_count=outcome.usage.retries, prompt_hash=prompt_hash(agent),
+                 success=bool(outcome.hset.hypotheses),
                  hit_service=hits["hit_service"], hit_fault=hits["hit_fault"],
-                 payload={"scored_after_the_fact": True})
+                 payload={"hypotheses": outcome.hset.model_dump(mode="json")["hypotheses"],
+                          "notes": outcome.hset.notes})
 
     wall = (time.monotonic() - t0) * 1000
     em.event("run_end", agent="pipeline", wave=3, duration_ms=wall, score=scored["score"],

@@ -193,14 +193,22 @@ def _caps(model: str) -> dict[str, bool]:
 
 def _call_raw(model: str, messages: list[dict], tools: list[dict] | None,
               max_tokens: int) -> Any:
-    """One request, retrying once against each known parameter incompatibility.
+    """One request, adapting to per-model parameter incompatibilities.
 
     Model families differ on `max_tokens` vs `max_completion_tokens` and on
     whether a non-default temperature is allowed. Probing beats a hardcoded model
     list, which would be wrong the week a new model ships.
+
+    The reaction is driven by the error MESSAGE, never by the current cached
+    flag. `_CAPS` is shared across the wave-1 threads, so gating on it created a
+    race: the first agent to see the 400 flipped the flag, and every other agent
+    already in flight then fell through to `raise` instead of retrying. That cost
+    three of five agents on the first live run — they returned nothing, having
+    made zero queries.
     """
     caps = _caps(model)
-    for _ in range(3):
+    last: Exception | None = None
+    for _ in range(4):
         kwargs: dict[str, Any] = {"model": model, "messages": messages}
         if tools:
             kwargs["tools"] = tools
@@ -211,16 +219,32 @@ def _call_raw(model: str, messages: list[dict], tools: list[dict] | None,
         try:
             return client().chat.completions.create(**kwargs)
         except openai.BadRequestError as exc:
-            msg = str(exc)
-            if "max_tokens" in msg and caps["max_completion_tokens"]:
-                caps["max_completion_tokens"] = False
-            elif "max_completion_tokens" in msg and not caps["max_completion_tokens"]:
-                caps["max_completion_tokens"] = True
-            elif "temperature" in msg and caps["temperature"]:
+            last = exc
+            msg = str(exc).lower()
+            if "temperature" in msg:
                 caps["temperature"] = False
+            elif "max_completion_tokens" in msg:
+                caps["max_completion_tokens"] = False
+            elif "max_tokens" in msg:
+                caps["max_completion_tokens"] = True
             else:
                 raise
-    raise RuntimeError(f"could not find a working parameter set for {model}")
+    raise RuntimeError(f"could not find a working parameter set for {model}: {last}")
+
+
+def warm(model: str, em: Emitter) -> None:
+    """Discover a model's parameter quirks once, before the fan-out.
+
+    Without this the first five concurrent agents each pay a failed request to
+    learn the same thing.
+    """
+    if model in _CAPS:
+        return
+    try:
+        _call_raw(model, [{"role": "user", "content": "ok"}], None, 16)
+    except Exception as exc:  # noqa: BLE001 — warming is best effort
+        em.event("error", agent="pipeline", wave=0, success=False,
+                 error_msg=f"warm {model}: {exc}"[:300])
 
 
 def call(*, model: str, system: str, messages: list[dict], tools: list[dict] | None = None,

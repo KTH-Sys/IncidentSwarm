@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from agents.hotdata_scope import SLICES, BudgetExceeded, ScopedDB, query
@@ -26,7 +27,7 @@ from agents.llm import (
     prompt_hash,
     validated_call,
 )
-from agents.schemas import HypothesisSet
+from agents.schemas import AgentName, HypothesisSet
 from telemetry.emit import Emitter
 
 MAX_TURNS = 24
@@ -149,8 +150,26 @@ def _run_tool(name: str, args: dict, scope: ScopedDB, em: Emitter) -> str:
     return out
 
 
+@dataclass
+class AgentOutcome:
+    """What wave 1 produced, WITHOUT the agent_end row.
+
+    The row is emitted by the pipeline instead, after truth-derived hit_service /
+    hit_fault are known. Emitting here and amending later produced two agent_end
+    rows per agent, which silently halves Q1's hit_rate and doubles Q7's agent
+    count — the aggregation convention in §9.1 assumes exactly one.
+    """
+
+    hset: HypothesisSet
+    usage: Usage
+    duration_ms: float
+    queries: int
+    db_id: str
+    model: str
+
+
 def run_agent(agent: str, scope: ScopedDB, symptoms: list[dict], em: Emitter, *,
-              model: str = FAST_MODEL) -> tuple[HypothesisSet, Usage]:
+              model: str = FAST_MODEL) -> AgentOutcome:
     """Run one wave-1 agent to a validated HypothesisSet.
 
     Never raises: a failed agent returns an empty HypothesisSet so the correlator
@@ -210,12 +229,8 @@ def run_agent(agent: str, scope: ScopedDB, symptoms: list[dict], em: Emitter, *,
     if hset is None:
         hset = HypothesisSet.empty(agent)
     hset.queries_used = scope.used
+    hset.agent = AgentName(agent)  # trust the caller, not the model's self-label
 
-    em.event("agent_end", agent=agent, wave=1, db_id=scope.db_id, model=model,
-             duration_ms=(time.monotonic() - t0) * 1000, query_count=scope.used,
-             tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
-             cost_usd=usage.cost_usd, retry_count=usage.retries,
-             prompt_hash=prompt_hash(agent), success=bool(hset.hypotheses),
-             payload={"hypotheses": hset.model_dump(mode="json")["hypotheses"],
-                      "notes": hset.notes})
-    return hset, usage
+    return AgentOutcome(hset=hset, usage=usage,
+                        duration_ms=(time.monotonic() - t0) * 1000,
+                        queries=scope.used, db_id=scope.db_id, model=model)

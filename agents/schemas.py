@@ -9,6 +9,7 @@ set (emit `error`). One agent failing must not kill the run.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator
@@ -34,6 +35,22 @@ class AgentName(str, Enum):
     HISTORY = "history"
 
 
+# Stems, not exact values: "LogAgent (wave 1)" must reach `logs`, and "logs" is
+# not a substring of "logagent". Pydantic claims leading-underscore class attrs,
+# so this lives at module scope.
+AGENT_STEMS: tuple[tuple[str, AgentName], ...] = (
+    ("log", AgentName.LOGS),
+    ("metric", AgentName.METRICS),
+    ("change", AgentName.CHANGES),
+    ("deploy", AgentName.CHANGES),
+    ("infra", AgentName.INFRA),
+    ("k8s", AgentName.INFRA),
+    ("kube", AgentName.INFRA),
+    ("history", AgentName.HISTORY),
+    ("postmortem", AgentName.HISTORY),
+)
+
+
 class Source(str, Enum):
     CHANGES = "changes"
     METRICS = "metrics"
@@ -55,10 +72,23 @@ class Hypothesis(BaseModel):
 
 
 class HypothesisSet(BaseModel):
-    agent: AgentName
+    # Models label themselves inconsistently ("LogAgent (wave 1)"), which failed
+    # validation and burned a retry. The runner knows which agent it called, so
+    # a loose label is coerced here and overwritten by the caller afterwards.
+    agent: AgentName = AgentName.LOGS
     hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=3)
     queries_used: int = 0
     notes: str = ""
+
+    @field_validator("agent", mode="before")
+    @classmethod
+    def _coerce_agent(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            low = v.lower()
+            for stem, name in AGENT_STEMS:
+                if stem in low:
+                    return name.value
+        return v
 
     @field_validator("hypotheses")
     @classmethod
