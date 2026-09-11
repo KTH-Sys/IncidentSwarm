@@ -140,3 +140,36 @@ through the databases/uploads APIs.
 
 `QueryResponse.execution_time_ms` is the server-side duration — telemetry uses it
 for `query.duration_ms` in preference to the client-side clock.
+
+## Model provider: OpenAI
+
+The agents run on OpenAI (`openai` SDK, chat completions). Tiers are set in
+`.env` — `FAST_MODEL` for the five wave-1 agents, `STRONG_MODEL` for the
+correlator and the baseline's synthesis call. `python -m bench.preflight
+--list-models` lists what the key can actually use, so the tiers are chosen
+rather than guessed.
+
+Three things this changed:
+
+- **Cost telemetry needs `MODEL_PRICING` in `.env`** — USD per 1M tokens as
+  `{"model": [input, output]}`. There is no built-in price table, because a
+  stale hardcoded one is worse than none: an unpriced model yields `cost_usd = 0`
+  and silently empties target T3 and every dollar figure in the demo. Preflight
+  fails when a configured model has no price. Pricing resolves lazily at call
+  time, not at import, so it cannot depend on whether `.env` loaded first.
+
+- **Tool-result turns differ by provider.** OpenAI takes one `role="tool"`
+  message per call, keyed by `tool_call_id`, where Anthropic takes a single user
+  message holding every result block. `agents/llm.py` owns that shape via
+  `append_assistant` / `append_tool_results`, and the agent loop works against a
+  normalized `LLMResponse`, so swapping providers again touches one file.
+
+- **Request parameters are probed, not hardcoded.** Newer models take
+  `max_completion_tokens` and reject `max_tokens`; reasoning models reject a
+  non-default `temperature`. `_call_raw` retries once against each known
+  incompatibility and caches the answer per model, rather than carrying a model
+  list that goes stale the week a new model ships.
+
+Temperature 0 (plan §7.2) therefore holds only where the model accepts it. Both
+arms of the experiment use the same models and the same correlator prompt, so
+the parallel-vs-single control is unaffected either way.

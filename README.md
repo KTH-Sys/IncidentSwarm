@@ -106,7 +106,8 @@ questions were resolved, how, and what changed as a result.
 
 ```bash
 uv sync
-cp .env.example .env          # HOTDATA_API_KEY, HOTDATA_WORKSPACE, ANTHROPIC_API_KEY
+cp .env.example .env          # HOTDATA_API_KEY, HOTDATA_WORKSPACE, OPENAI_API_KEY
+                              # then set MODEL_PRICING, or cost telemetry reads 0
 
 # one-time: create the event-scoped telemetry DB, then put the id in .env
 uv run python -m bench.preflight --create-telemetry-db

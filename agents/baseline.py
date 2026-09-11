@@ -16,7 +16,17 @@ from typing import Any
 
 from agents.agent import INDEXED_COLUMN, ROWS_PREVIEW, SCHEMA_HINT, MAX_TURNS
 from agents.hotdata_scope import SINGLE_BUDGET, BudgetExceeded, ScopedDB, query
-from agents.llm import FAST_MODEL, STRONG_MODEL, Usage, call, load_prompt, prompt_hash, validated_call
+from agents.llm import (
+    FAST_MODEL,
+    STRONG_MODEL,
+    Usage,
+    append_assistant,
+    append_tool_results,
+    call,
+    load_prompt,
+    prompt_hash,
+    validated_call,
+)
 from agents.schemas import RCAReport
 from telemetry.emit import Emitter
 
@@ -114,7 +124,7 @@ def run_baseline(scope: ScopedDB, symptoms: list[dict], em: Emitter, *,
     tools = [TOOL_SQL, TOOL_FTS, TOOL_VECTOR]
 
     try:
-        for _ in range(MAX_TURNS * 2):  # more turns: it has 5 sources and 110 queries
+        for _ in range(MAX_TURNS * 2):  # more turns: 5 sources and 110 queries
             if scope.remaining <= 0:
                 convo.append({"role": "user", "content":
                               "Query budget exhausted. Produce your RCAReport now."})
@@ -122,27 +132,23 @@ def run_baseline(scope: ScopedDB, symptoms: list[dict], em: Emitter, *,
             resp = call(model=fast_model, system=load_prompt("single"), messages=convo,
                         tools=tools, em=em, agent="single", wave=1, usage=usage,
                         prompt_name="single")
-            convo.append({"role": "assistant", "content": resp.content})
-            if resp.stop_reason != "tool_use":
+            append_assistant(convo, resp)
+            if not resp.wants_tools:
                 break
-            results = []
-            for block in resp.content:
-                if block.type != "tool_use":
-                    continue
+            results: list[tuple[str, str]] = []
+            for tc in resp.tool_calls:
                 try:
-                    out = _run_tool(block.name, dict(block.input), scope, em)
+                    out = _run_tool(tc.name, tc.args, scope, em)
                 except BudgetExceeded:
                     out = "Budget exhausted. Produce your RCAReport now."
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": out[:20000]})
-            convo.append({"role": "user", "content": results})
+                results.append((tc.id, out[:20000]))
+            append_tool_results(convo, results)
     except Exception as exc:  # noqa: BLE001
         em.event("error", agent="single", wave=1, success=False, error_msg=str(exc)[:500])
 
     investigation = "\n\n".join(
-        b.text for m in convo if m["role"] == "assistant"
-        for b in (m["content"] if isinstance(m["content"], list) else [])
-        if getattr(b, "type", None) == "text"
+        m["content"] for m in convo
+        if m["role"] == "assistant" and isinstance(m.get("content"), str) and m["content"]
     )
 
     em.event("agent_end", agent="single", wave=1, db_id=scope.db_id, model=fast_model,

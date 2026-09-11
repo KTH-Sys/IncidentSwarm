@@ -16,7 +16,16 @@ import time
 from typing import Any
 
 from agents.hotdata_scope import SLICES, BudgetExceeded, ScopedDB, query
-from agents.llm import FAST_MODEL, Usage, load_prompt, prompt_hash, validated_call
+from agents.llm import (
+    FAST_MODEL,
+    Usage,
+    append_assistant,
+    append_tool_results,
+    call,
+    load_prompt,
+    prompt_hash,
+    validated_call,
+)
 from agents.schemas import HypothesisSet
 from telemetry.emit import Emitter
 
@@ -170,26 +179,23 @@ def run_agent(agent: str, scope: ScopedDB, symptoms: list[dict], em: Emitter, *,
                 convo.append({"role": "user", "content":
                               "Query budget exhausted. Return your HypothesisSet JSON now."})
                 break
-            from agents.llm import call
             resp = call(model=model, system=system, messages=convo, tools=tools,
                         em=em, agent=agent, wave=1, usage=usage, prompt_name=agent)
-            convo.append({"role": "assistant", "content": resp.content})
+            append_assistant(convo, resp)
 
-            if resp.stop_reason != "tool_use":
+            if not resp.wants_tools:
                 break
 
-            results = []
-            for block in resp.content:
-                if block.type != "tool_use":
-                    continue
+            # Every issued tool call must get a result back, or the next request
+            # is rejected for an unanswered call — including budget refusals.
+            results: list[tuple[str, str]] = []
+            for tc in resp.tool_calls:
                 try:
-                    out = _run_tool(block.name, dict(block.input), scope, em)
+                    out = _run_tool(tc.name, tc.args, scope, em)
                 except BudgetExceeded:
                     out = "Budget exhausted. Return your HypothesisSet JSON now."
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": out[:20000]})
-            # All tool_results go back in ONE user message.
-            convo.append({"role": "user", "content": results})
+                results.append((tc.id, out[:20000]))
+            append_tool_results(convo, results)
 
         hset = validated_call(
             model=model, system=system,

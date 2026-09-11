@@ -36,13 +36,13 @@ def record(name: str, status: str, detail: str = "") -> None:
 
 
 def check_env() -> bool:
-    required = ("HOTDATA_API_KEY", "HOTDATA_WORKSPACE")
-    optional = ("TELEMETRY_DB_ID", "ANTHROPIC_API_KEY", "HOTDATA_EMBEDDING_PROVIDER_ID")
+    required = ("HOTDATA_API_KEY", "HOTDATA_WORKSPACE", "OPENAI_API_KEY")
+    optional = ("TELEMETRY_DB_ID", "MODEL_PRICING", "HOTDATA_EMBEDDING_PROVIDER_ID")
     missing = [k for k in required if not os.getenv(k)]
     if missing:
-        record("env: hotdata credentials", BAD, f"missing {', '.join(missing)}")
+        record("env: credentials", BAD, f"missing {', '.join(missing)}")
         return False
-    record("env: hotdata credentials", OK)
+    record("env: credentials", OK, "hotdata + openai")
     for k in optional:
         record(f"env: {k}", OK if os.getenv(k) else SKIP,
                "" if os.getenv(k) else "not set")
@@ -62,20 +62,47 @@ def check_hotdata_reachable() -> bool:
         return False
 
 
-def check_anthropic() -> bool:
-    try:
-        from agents.llm import FAST_MODEL, client
+def check_models() -> bool:
+    """Call both tiers for real. A model that only fails under tool use at 13:30
+    is a model that cost you the batch."""
+    from agents.llm import FAST_MODEL, STRONG_MODEL, Usage, call, price_of
 
-        resp = client().messages.create(
-            model=FAST_MODEL, max_tokens=8,
-            messages=[{"role": "user", "content": "Reply with the single word: ok"}],
-            temperature=0)
-        record("anthropic: fast model", OK,
-               f"{FAST_MODEL}, {resp.usage.input_tokens}+{resp.usage.output_tokens} tokens")
-        return True
-    except Exception as exc:  # noqa: BLE001
-        record("anthropic: fast model", BAD, str(exc)[:200])
-        return False
+    from telemetry.emit import Emitter, ParquetSink, RunContext
+
+    em = Emitter(RunContext("preflight", "preflight", "parallel", "probe"),
+                 ParquetSink(Path(tempfile.mkdtemp())), load_only=True)
+    ok_all = True
+    for tier, model in (("fast", FAST_MODEL), ("strong", STRONG_MODEL)):
+        try:
+            u = Usage()
+            r = call(model=model, system="Reply with exactly: ok",
+                     messages=[{"role": "user", "content": "ok?"}], em=em,
+                     agent="pipeline", wave=0, usage=u, max_tokens=16)
+            record(f"model: {tier}", OK,
+                   f"{model}, {u.tokens_in}+{u.tokens_out} tokens, ${u.cost_usd:.6f}")
+        except Exception as exc:  # noqa: BLE001
+            record(f"model: {tier}", BAD, f"{model}: {str(exc)[:180]}")
+            ok_all = False
+        pin, pout = price_of(model)
+        if (pin, pout) == (0.0, 0.0):
+            record(f"pricing: {model}", BAD,
+                   "not in MODEL_PRICING — cost_usd would be 0 and target T3 meaningless")
+            ok_all = False
+        else:
+            record(f"pricing: {model}", OK, f"${pin}/${pout} per 1M in/out")
+    em.flush(final=True)
+    return ok_all
+
+
+def list_models() -> None:
+    """Show what this key can actually use, so the tiers are picked, not guessed."""
+    from agents.llm import client
+
+    names = sorted(m.id for m in client().models.list().data)
+    print(f"{len(names)} models available to this key:\n")
+    for n in names:
+        print(f"  {n}")
+    print("\nSet FAST_MODEL and STRONG_MODEL in .env from this list.")
 
 
 def check_data() -> bool:
@@ -226,14 +253,20 @@ def main() -> int:
     ap.add_argument("--repair-telemetry-db", metavar="DB_ID",
                     help="seed the frozen schema on an existing telemetry DB")
     ap.add_argument("--skip-gate1", action="store_true", help="skip the live DB cycle")
+    ap.add_argument("--list-models", action="store_true",
+                    help="list the models this OpenAI key can use, then exit")
     args = ap.parse_args()
+
+    if args.list_models:
+        list_models()
+        return 0
 
     print("IncidentSwarm preflight\n")
     have_env = check_env()
     print()
 
     if args.create_telemetry_db or args.repair_telemetry_db:
-        if not have_env:
+        if not (os.getenv("HOTDATA_API_KEY") and os.getenv("HOTDATA_WORKSPACE")):
             print("\nCannot touch the telemetry DB without hotdata credentials.")
             return 1
         create_telemetry_db(args.repair_telemetry_db)
@@ -247,7 +280,10 @@ def main() -> int:
         print()
         check_telemetry_db()
     print()
-    check_anthropic()
+    if os.getenv("OPENAI_API_KEY"):
+        check_models()
+    else:
+        record("model: fast/strong", BAD, "OPENAI_API_KEY is not set")
 
     failures = [r for r in _results if r[1] == BAD]
     print(f"\n{len(_results) - len(failures)}/{len(_results)} checks passed")
